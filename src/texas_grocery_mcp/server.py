@@ -204,7 +204,11 @@ mcp.tool(annotations={"readOnlyHint": True})(health_ready)
 
 def main() -> None:
     """Run the MCP server."""
-    mcp.run()
+    mcp.run(
+        transport="streamable-http",
+        host="127.0.0.1",
+        port=3000,
+    )
 
 
 if __name__ == "__main__":
