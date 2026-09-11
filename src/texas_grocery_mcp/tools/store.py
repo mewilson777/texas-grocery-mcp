@@ -147,29 +147,14 @@ def set_default_store_id(store_id: str | None) -> None:
 @ensure_session
 async def store_change(
     store_id: Annotated[str, Field(description="Store ID to change to", min_length=1)],
-    ignore_conflicts: Annotated[
-        bool,
-        Field(
-            description=(
-                "Force store change even if cart has conflicts (items unavailable, "
-                "price changes). Default False - will fail safely and report conflicts."
-            ),
-        ),
-    ] = False,
 ) -> dict[str, Any]:
     """Change the active store for HEB operations.
 
     When authenticated: Changes the store on HEB.com via their API with verification.
     When not authenticated: Sets a local default for product searches.
 
-    The store change is VERIFIED by checking the cart's actual store after the
-    mutation. This ensures we never return success when the store didn't actually
-    change (e.g., due to cart conflicts).
-
     Args:
         store_id: The store ID to change to
-        ignore_conflicts: If True, force store change even if cart has items
-            unavailable at the new store or with price changes. Default False.
     """
     from texas_grocery_mcp.auth.session import is_authenticated
 
@@ -193,40 +178,6 @@ async def store_change(
         store_address = store.address
         supports_curbside = store.supports_curbside
 
-    # Check if store supports curbside/online shopping
-    if not supports_curbside:
-        # Find nearest eligible store to suggest
-        suggestion = None
-        for s in StateManager.get_cached_stores_values():
-            if s.supports_curbside and s.store_id != store_id:
-                suggestion = {
-                    "store_id": s.store_id,
-                    "name": s.name,
-                    "address": s.address,
-                    "distance_miles": s.distance_miles,
-                }
-                break
-
-        store_label = store_name or f"Store {store_id}"
-        message = (
-            f"{store_label} doesn't support online shopping (curbside pickup). "
-            "This store is in-store only."
-        )
-
-        if suggestion:
-            message = f"{message} Try {suggestion['name']} instead."
-
-        result: dict[str, Any] = {
-            "error": True,
-            "code": "STORE_NOT_ELIGIBLE",
-            "message": message,
-            "store_id": store_id,
-            "store_name": store_name,
-        }
-        if suggestion:
-            result["suggestion"] = suggestion
-        return result
-
     # If not authenticated, set local default only
     if not is_authenticated():
         StateManager.set_default_store_id_sync(store_id)
@@ -246,11 +197,10 @@ async def store_change(
 
     # Call the GraphQL API to change the store (with verification)
     client = _get_client()
-    result = await client.select_store(store_id, ignore_conflicts=ignore_conflicts)
+    result = await client.select_store(store_id)
 
     if result.get("error"):
-        # API failed or verification failed - return the error details
-        error_response = {
+        return {
             "error": True,
             "code": result.get("code", "STORE_CHANGE_FAILED"),
             "message": result.get("message", "Failed to change store via API"),
@@ -258,27 +208,7 @@ async def store_change(
             "store_name": store_name,
         }
 
-        # Include additional context from the API response
-        if result.get("expected_store"):
-            error_response["expected_store"] = result["expected_store"]
-        if result.get("actual_store"):
-            error_response["actual_store"] = result["actual_store"]
-        if result.get("suggestion"):
-            error_response["suggestion"] = result["suggestion"]
-
-        # For cart conflicts, add specific guidance
-        if result.get("code") == "CART_CONFLICT":
-            error_response["help"] = (
-                "Your cart has items that may be unavailable or priced differently at the "
-                "new store. "
-                "Options: (1) Call store_change with ignore_conflicts=True to force the change, "
-                "(2) Clear your cart first, or (3) Keep your current store."
-            )
-
-        return error_response
-
-    # SUCCESS - Store change verified!
-    # Now safe to update local state since we know server state matches
+    # SUCCESS - update local state to match
     StateManager.set_default_store_id_sync(store_id)
 
     # Update the cookie in auth.json so session_status reflects the change

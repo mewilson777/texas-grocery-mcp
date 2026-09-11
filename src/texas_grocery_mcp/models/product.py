@@ -16,14 +16,6 @@ class ProductNutrition(BaseModel):
     sodium: str | None = None
 
 
-class ProductCoupon(BaseModel):
-    """Coupon applicable to product."""
-
-    code: str
-    discount: str
-    expires: str | None = None
-
-
 # ============================================================================
 # Product Details Models (for product_get tool)
 # ============================================================================
@@ -167,26 +159,18 @@ class ProductDetails(BaseModel):
 
 
 class Product(BaseModel):
-    """HEB product information.
+    """HEB product information."""
 
-    IMPORTANT FOR CART OPERATIONS:
-    - Use `product_id` as the first argument to cart_add
-    - Use `sku` as the second argument (sku_id) to cart_add
-
-    Example:
-        cart_add(product_id=product.product_id, sku_id=product.sku, quantity=1)
-    """
-
-    # SKU - the longer identifier needed for cart operations
-    sku: str = Field(description="SKU ID (longer numeric ID) - use as sku_id in cart_add")
+    # SKU - the longer identifier
+    sku: str = Field(description="SKU ID (longer numeric ID)")
     name: str = Field(description="Product name")
     price: float = Field(description="Current price")
     available: bool = Field(description="In stock at store")
 
-    # Product ID - the shorter identifier needed for cart operations
+    # Product ID - the shorter identifier
     product_id: str | None = Field(
         default=None,
-        description="Product ID (shorter numeric ID) - use as product_id in cart_add"
+        description="Product ID (shorter numeric ID)"
     )
 
     # Standard fields (optional)
@@ -196,7 +180,6 @@ class Product(BaseModel):
     image_url: str | None = Field(default=None, description="Product image URL")
     aisle: str | None = Field(default=None, description="Store aisle number")
     section: str | None = Field(default=None, description="Store section")
-    has_coupon: bool = Field(default=False, description="Coupon available for this product")
 
     # Extended fields (optional)
     nutrition: ProductNutrition | None = Field(default=None, description="Nutrition facts")
@@ -204,9 +187,6 @@ class Product(BaseModel):
     on_sale: bool = Field(default=False, description="Currently on sale")
     original_price: float | None = Field(default=None, description="Price before sale")
     rating: float | None = Field(default=None, ge=0, le=5, description="Customer rating")
-    coupons: list[ProductCoupon] = Field(
-        default_factory=list, description="Applicable coupons"
-    )
 
 
 class ProductSearchAttempt(BaseModel):

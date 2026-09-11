@@ -6,7 +6,6 @@ This guide covers common issues and their solutions when using the Texas Grocery
 
 - [Session & Authentication Issues](#session--authentication-issues)
 - [Product Search Issues](#product-search-issues)
-- [Cart Issues](#cart-issues)
 - [Store Issues](#store-issues)
 - [Network & API Issues](#network--api-issues)
 - [Installation Issues](#installation-issues)
@@ -135,10 +134,10 @@ This guide covers common issues and their solutions when using the Texas Grocery
 
 ---
 
-### "Cannot add to cart - missing product_id"
+### "No product_id available"
 
 **Symptoms:**
-- Product has `_warning: "Cannot add to cart - missing product_id"`
+- Product has `_warning: "No product_id available. Try a more specific search or refresh session."`
 - `product_id` starts with "suggestion-"
 
 **Cause:** The search fell back to typeahead suggestions which don't have real product IDs.
@@ -166,70 +165,6 @@ This guide covers common issues and their solutions when using the Texas Grocery
 2. If not authenticated: session_refresh(headless=False)
 3. Set a store: store_change("store_id")
 4. Search again
-```
-
----
-
-## Cart Issues
-
-### "CART_ADD_NOT_VERIFIED" Error
-
-**Symptoms:**
-- `cart_add` returns `code: CART_ADD_NOT_VERIFIED`
-- Item doesn't appear in cart
-
-**Cause:** The item was sent to HEB but couldn't be verified in the cart afterwards.
-
-**Possible reasons:**
-- Product is out of stock
-- Product ID is wrong
-- Session issue
-
-**Solution:**
-```
-1. Verify the product exists: product_get(product_id="...")
-2. Check if it's available: look for available: true
-3. Try cart_add_with_retry which handles ID mismatches
-4. If still failing, refresh session and retry
-```
-
----
-
-### "SKU not found" / Wrong Product Added
-
-**Symptoms:**
-- `cart_add` succeeds but wrong item appears
-- Error mentions SKU mismatch
-
-**Cause:** The `product_id` and `sku_id` don't match.
-
-**Solution:**
-```
-1. Search for the product fresh: product_search("product name")
-2. Note BOTH IDs from results:
-   - product_id (short, e.g., "127074")
-   - sku (long, e.g., "127074-HEB")
-3. Use both in cart_add:
-   cart_add(product_id="127074", sku_id="127074-HEB", quantity=1, confirm=True)
-```
-
----
-
-### Cart Shows Different Store's Prices
-
-**Symptoms:**
-- Cart prices don't match what you searched
-- Items marked "unavailable at your store"
-
-**Cause:** Your HEB account store doesn't match the store you searched.
-
-**Solution:**
-```
-1. Check your current store: store_get_default()
-2. Change to the correct store: store_change("desired_store_id")
-3. If conflicts appear, either:
-   - Clear cart first, then change store
-   - Or use store_change(store_id="...", ignore_conflicts=True)
 ```
 
 ---
@@ -355,8 +290,6 @@ playwright install chromium
 |------|---------|----------|
 | `NO_STORE_SET` | No default store configured | Use `store_change("store_id")` |
 | `STORE_NOT_ELIGIBLE` | Store doesn't support online orders | Choose a different store |
-| `CART_ADD_NOT_VERIFIED` | Item add couldn't be confirmed | Check product availability, retry |
-| `CART_CONFLICT` | Cart has items unavailable at new store | Use `ignore_conflicts=True` or clear cart |
 | `INVALID_PRODUCT_ID` | Product ID format is wrong | Use ID from `product_search` results |
 | `PRODUCT_NOT_FOUND` | Product doesn't exist | Verify product ID |
 | `LOGIN_REQUIRED` | Session expired | Use `session_refresh(headless=False)` |

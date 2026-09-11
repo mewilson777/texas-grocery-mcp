@@ -6,23 +6,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastmcp import FastMCP
 
-from texas_grocery_mcp.observability.health import health_live, health_ready
 from texas_grocery_mcp.observability.logging import configure_logging
-from texas_grocery_mcp.tools.cart import (
-    cart_add,
-    cart_add_many,
-    cart_add_with_retry,
-    cart_check_auth,
-    cart_get,
-    cart_remove,
-)
-from texas_grocery_mcp.tools.coupon import (
-    coupon_categories,
-    coupon_clip,
-    coupon_clipped,
-    coupon_list,
-    coupon_search,
-)
 from texas_grocery_mcp.tools.product import product_get, product_search, product_search_batch
 from texas_grocery_mcp.tools.session import (
     session_clear,
@@ -103,7 +87,7 @@ MCP_INSTRUCTIONS = """
 
 This MCP requires an authenticated HEB.com session for most operations.
 
-### Before using cart, coupon, or store_change tools:
+### Before using the store_change tool:
 1. Call `session_status` to check authentication state
 2. If `authenticated: false` or `needs_refresh: true`, call `session_refresh`
 3. If session_refresh fails with headless mode, retry with `headless=False` for manual login
@@ -111,7 +95,7 @@ This MCP requires an authenticated HEB.com session for most operations.
 ### Session states:
 - `authenticated: true, needs_refresh: false` → Ready to use all tools
 - `authenticated: true, refresh_recommended: true` → Works but consider refreshing soon
-- `authenticated: false` or `needs_refresh: true` → Must refresh before cart/coupon operations
+- `authenticated: false` or `needs_refresh: true` → Must refresh before store_change
 
 ### Tools that work WITHOUT authentication:
 - `store_search` - Find stores by address
@@ -122,8 +106,6 @@ This MCP requires an authenticated HEB.com session for most operations.
 
 ### Tools that REQUIRE authentication:
 - `store_change` - Change store on HEB.com account
-- `cart_get`, `cart_add`, `cart_add_many`, `cart_remove` - Cart operations
-- `coupon_list`, `coupon_clip`, `coupon_clipped` - Coupon operations
 
 ### Typical workflow:
 1. `session_status` → Check if authenticated
@@ -131,7 +113,6 @@ This MCP requires an authenticated HEB.com session for most operations.
 3. `store_search("address")` → Find nearby stores
 4. `store_change(store_id)` → Set preferred store
 5. `product_search("query")` → Search for products
-6. `cart_add(sku)` → Add to cart
 
 ### Automatic Login (Optional)
 Save your HEB credentials once for automatic login when sessions expire:
@@ -174,21 +155,6 @@ mcp.tool(annotations={"readOnlyHint": True})(product_search)
 mcp.tool(annotations={"readOnlyHint": True})(product_search_batch)
 mcp.tool(annotations={"readOnlyHint": True})(product_get)
 
-# Register coupon tools
-mcp.tool(annotations={"readOnlyHint": True})(coupon_list)
-mcp.tool(annotations={"readOnlyHint": True})(coupon_search)
-mcp.tool(annotations={"readOnlyHint": True})(coupon_categories)
-mcp.tool(annotations={"destructiveHint": True})(coupon_clip)
-mcp.tool(annotations={"readOnlyHint": True})(coupon_clipped)
-
-# Register cart tools (destructive operations require confirmation)
-mcp.tool(annotations={"readOnlyHint": True})(cart_check_auth)
-mcp.tool(annotations={"readOnlyHint": True})(cart_get)
-mcp.tool(annotations={"destructiveHint": True})(cart_add)
-mcp.tool(annotations={"destructiveHint": True})(cart_add_many)
-mcp.tool(annotations={"destructiveHint": True})(cart_add_with_retry)
-mcp.tool(annotations={"destructiveHint": True})(cart_remove)
-
 # Register session tools
 mcp.tool(annotations={"readOnlyHint": True})(session_status)
 mcp.tool(annotations={"readOnlyHint": True})(session_save_instructions)
@@ -196,10 +162,6 @@ mcp.tool()(session_refresh)  # Uses embedded Playwright when available, falls ba
 mcp.tool()(session_clear)
 mcp.tool()(session_save_credentials)  # Store HEB credentials for auto-login
 mcp.tool()(session_clear_credentials)  # Remove stored credentials
-
-# Register health check tools
-mcp.tool(annotations={"readOnlyHint": True})(health_live)
-mcp.tool(annotations={"readOnlyHint": True})(health_ready)
 
 
 def main() -> None:

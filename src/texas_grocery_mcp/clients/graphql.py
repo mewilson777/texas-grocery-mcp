@@ -13,9 +13,6 @@ import structlog
 
 from texas_grocery_mcp.auth.session import get_httpx_cookies, is_authenticated
 from texas_grocery_mcp.models import (
-    Coupon,
-    CouponCategory,
-    CouponSearchResult,
     GeocodedLocation,
     NutrientInfo,
     Product,
@@ -60,11 +57,8 @@ class PersistedQueryNotFoundError(Exception):
 PERSISTED_QUERIES = {
     "ShopNavigation": "0e669423cef683226cb8eb295664619c8e0f95945734e0a458095f51ee89efb3",
     "alertEntryPoint": "3e3ccd248652e8fce4674d0c5f3f30f2ddc63da277bfa0ff36ea9420e5dffd5e",
-    "cartEstimated": "7b033abaf2caa80bc49541e51d2b89e3cc6a316e37c4bd576d9b5c498a51e9c5",
     "typeaheadContent": "1ed956c0f10efcfc375321f33c40964bc236fff1397a4e86b7b53cb3b18ad329",
-    "cartItemV2": "ade8ec1365c185244d42f9cc4c13997fec4b633ac3c38ff39558df92b210c6d0",
     "StoreSearch": "e01fa39e66c3a2c7881322bc48af6a5af97d49b1442d433f2d09d273de2db4b6",
-    "CouponClip": "88b18ac22cee98372428d9a91d759ffb5e919026ee61c747f9f88d11336b846b",
     # Store change mutation - changes the active pickup store
     "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
 }
@@ -103,7 +97,7 @@ class HEBGraphQLClient:
 
     Supports two modes:
     - Unauthenticated: Basic operations like typeahead (always available)
-    - Authenticated: Full product search and cart operations (requires cookies)
+    - Authenticated: Full product search and account operations (requires cookies)
     """
 
     # Standard headers for browser-like requests
@@ -1664,12 +1658,9 @@ class HEBGraphQLClient:
         location = item.get("productLocation", {})
         aisle = location.get("location") if location else None
 
-        # Extract coupon flag
-        has_coupon = item.get("showCouponFlag", False)
-
         return Product(
             sku=sku_id or product_id,
-            product_id=product_id,  # Store product ID separately for cart operations
+            product_id=product_id,  # Store product ID separately from SKU
             name=display_name,
             price=price,
             available=available,
@@ -1680,7 +1671,6 @@ class HEBGraphQLClient:
             aisle=aisle,
             on_sale=on_sale,
             original_price=original_price,
-            has_coupon=has_coupon,
         )
 
     async def get_categories(self) -> list[dict[str, Any]]:
@@ -1739,57 +1729,6 @@ class HEBGraphQLClient:
         except Exception as e:
             logger.error("Typeahead failed", term=term, error=str(e))
             return []
-
-    async def add_to_cart(
-        self,
-        product_id: str,
-        sku_id: str,
-        quantity: int = 1,
-    ) -> dict[str, Any]:
-        """Add an item to the cart using authenticated GraphQL.
-
-        Requires authentication cookies to be available.
-
-        Args:
-            product_id: The product ID
-            sku_id: The SKU ID
-            quantity: Number to add
-
-        Returns:
-            Cart response data or error dict if not authenticated
-        """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
-            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
-
-        return await self._execute_persisted_query_with_client(
-            auth_client,
-            "cartItemV2",
-            {
-                "userIsLoggedIn": True,
-                "productId": product_id,
-                "skuId": sku_id,
-                "quantity": quantity,
-            },
-        )
-
-    async def get_cart(self) -> dict[str, Any]:
-        """Get current cart contents using authenticated GraphQL.
-
-        Requires authentication cookies to be available.
-
-        Returns:
-            Cart data or error dict if not authenticated
-        """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
-            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
-
-        return await self._execute_persisted_query_with_client(
-            auth_client,
-            "cartEstimated",
-            {"userIsLoggedIn": True},
-        )
 
     @with_retry(config=RetryConfig(max_attempts=3, base_delay=1.0))
     async def _execute_persisted_query_with_client(
@@ -1867,340 +1806,22 @@ class HEBGraphQLClient:
             "known_stores": len(KNOWN_STORES),
         }
 
-    # ===================
-    # Coupon Methods
-    # ===================
-
-    async def get_coupons(
-        self,
-        category_id: int | None = None,
-        search_query: str | None = None,
-        limit: int = 60,
-    ) -> CouponSearchResult:
-        """Fetch available coupons.
-
-        Coupons are loaded via SSR from the all-coupons page.
-
-        Args:
-            category_id: Filter by category ID (e.g., 490021 for Health & beauty)
-            search_query: Search coupons by keyword
-            limit: Maximum coupons to return (max 60 per page)
-
-        Returns:
-            CouponSearchResult with coupons and metadata
-        """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
-            logger.warning("Coupon fetch requires authentication for full data")
-            return CouponSearchResult(
-                coupons=[],
-                count=0,
-                total=0,
-                categories=[],
-            )
-
-        try:
-            return await self._fetch_coupons_ssr(
-                auth_client,
-                category_id=category_id,
-                search_query=search_query,
-                limit=limit,
-            )
-        except Exception as e:
-            logger.error("Failed to fetch coupons", error=str(e))
-            return CouponSearchResult(
-                coupons=[],
-                count=0,
-                total=0,
-                categories=[],
-            )
-
-    @with_retry(config=RetryConfig(max_attempts=2, base_delay=0.5))
-    async def _fetch_coupons_ssr(
-        self,
-        client: httpx.AsyncClient,
-        category_id: int | None = None,
-        search_query: str | None = None,
-        limit: int = 60,
-    ) -> CouponSearchResult:
-        """Fetch coupons via SSR page.
-
-        Args:
-            client: Authenticated httpx client
-            category_id: Filter by category
-            search_query: Search term
-            limit: Max results
-
-        Returns:
-            CouponSearchResult with parsed coupon data
-        """
-        self.circuit_breaker.check()
-
-        # Build URL with query params
-        url = "https://www.heb.com/digital-coupon/coupon-selection/all-coupons"
-        params = {}
-
-        if search_query:
-            params["searchTerm"] = search_query
-        if category_id:
-            params["productCategories"] = str(category_id)
-
-        logger.debug("Fetching coupons SSR", url=url, params=params)
-
-        try:
-            response = await client.get(url, params=params if params else None)
-            response.raise_for_status()
-
-            # Extract __NEXT_DATA__ JSON from HTML
-            match = re.search(
-                r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-                response.text,
-                re.DOTALL,
-            )
-
-            if not match:
-                logger.warning("No __NEXT_DATA__ found in coupon response")
-                return CouponSearchResult(coupons=[], count=0, total=0, categories=[])
-
-            next_data = json.loads(match.group(1))
-            result = self._parse_coupon_ssr_data(next_data, limit)
-
-            self.circuit_breaker.record_success()
-            logger.info(
-                "Coupon fetch successful",
-                count=result.count,
-                total=result.total,
-            )
-
-            return result
-
-        except httpx.HTTPError as e:
-            self.circuit_breaker.record_failure()
-            logger.error("Coupon SSR fetch failed", error=str(e))
-            raise
-
-    def _parse_coupon_ssr_data(
-        self,
-        next_data: dict[str, Any],
-        limit: int = 60,
-    ) -> CouponSearchResult:
-        """Parse coupon data from SSR __NEXT_DATA__.
-
-        Args:
-            next_data: Parsed __NEXT_DATA__ JSON
-            limit: Max coupons to return
-
-        Returns:
-            CouponSearchResult with coupons and categories
-        """
-        page_props = next_data.get("props", {}).get("pageProps", {})
-
-        # Parse coupon data
-        coupon_data = page_props.get("couponData", [])
-        coupons: list[Coupon] = []
-
-        for item in coupon_data[:limit]:
-            try:
-                coupon = self._parse_coupon_item(item)
-                if coupon:
-                    coupons.append(coupon)
-            except Exception as e:
-                logger.debug("Failed to parse coupon", error=str(e))
-                continue
-
-        # Parse pagination
-        pagination = page_props.get("pagination", {})
-        total = pagination.get("totalCoupons", len(coupons))
-
-        # Parse categories from filters
-        categories: list[CouponCategory] = []
-        filters_info = page_props.get("filtersInfo", {})
-        filter_counts = filters_info.get("filterCounts", {})
-        product_categories = filter_counts.get("productCategories", [])
-
-        for cat in product_categories:
-            try:
-                categories.append(CouponCategory(
-                    id=cat.get("option", 0),
-                    name=cat.get("displayName", ""),
-                    count=cat.get("count", 0),
-                ))
-            except Exception:
-                continue
-
-        return CouponSearchResult(
-            coupons=coupons,
-            count=len(coupons),
-            total=total,
-            categories=categories,
-        )
-
-    def _parse_coupon_item(self, item: dict[str, Any]) -> Coupon | None:
-        """Parse a single coupon from SSR data.
-
-        Args:
-            item: Coupon dict from couponData array
-
-        Returns:
-            Coupon object or None if parsing fails
-        """
-        coupon_id = item.get("id")
-        if not coupon_id:
-            return None
-
-        # Parse expiration date
-        exp_date = item.get("expirationDate")
-        expires_display = None
-        if exp_date:
-            # Convert YYYY-MM-DD to more readable format
-            try:
-                from datetime import datetime
-                dt = datetime.strptime(exp_date, "%Y-%m-%d")
-                expires_display = dt.strftime("%m/%d/%Y")
-            except Exception:
-                expires_display = exp_date
-
-        # Determine if digital only
-        print_statuses = item.get("printStatuses", [])
-        digital_only = "PAPERLESS" in print_statuses and "PRINTED" not in print_statuses
-
-        # Parse usage limit
-        redemption_limit = item.get("redemptionLimit")
-        usage_limit = f"Limit {redemption_limit}" if redemption_limit else "Unlimited use"
-
-        return Coupon(
-            coupon_id=coupon_id,
-            headline=item.get("shortDescription", ""),
-            description=item.get("description", ""),
-            expires=exp_date,
-            expires_display=expires_display,
-            image_url=item.get("imageUrl"),
-            coupon_type=item.get("type", "NORMAL"),
-            clipped=item.get("clippedStatus") == "CLIPPED",
-            redeemable=item.get("redemptionStatus") == "REDEEMABLE",
-            usage_limit=usage_limit,
-            digital_only=digital_only,
-        )
-
-    async def clip_coupon(self, coupon_id: int) -> dict[str, Any]:
-        """Clip a coupon to the user's account.
-
-        Args:
-            coupon_id: The coupon ID to clip
-
-        Returns:
-            Result dict with success/error status
-        """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
-            return {
-                "error": True,
-                "code": "NOT_AUTHENTICATED",
-                "message": "Login required to clip coupons",
-            }
-
-        try:
-            result = await self._execute_persisted_query_with_client(
-                auth_client,
-                "CouponClip",
-                {
-                    "userIsLoggedIn": True,
-                    "id": coupon_id,
-                },
-            )
-
-            # Check if the mutation succeeded
-            clip_result = result.get("clipCoupon", {})
-            if clip_result:
-                return {
-                    "success": True,
-                    "coupon_id": coupon_id,
-                    "message": "Coupon clipped successfully!",
-                }
-            else:
-                return {
-                    "success": True,
-                    "coupon_id": coupon_id,
-                    "message": "Coupon clipped.",
-                }
-
-        except GraphQLError as e:
-            error_msg = str(e)
-            if "already clipped" in error_msg.lower():
-                return {
-                    "error": True,
-                    "code": "ALREADY_CLIPPED",
-                    "message": "This coupon is already clipped to your account.",
-                    "coupon_id": coupon_id,
-                }
-            logger.error("Failed to clip coupon", coupon_id=coupon_id, error=error_msg)
-            return {
-                "error": True,
-                "code": "CLIP_FAILED",
-                "message": f"Failed to clip coupon: {error_msg}",
-                "coupon_id": coupon_id,
-            }
-        except Exception as e:
-            logger.error("Failed to clip coupon", coupon_id=coupon_id, error=str(e))
-            return {
-                "error": True,
-                "code": "CLIP_FAILED",
-                "message": f"Failed to clip coupon: {e!s}",
-                "coupon_id": coupon_id,
-            }
-
-    async def get_clipped_coupons(self, limit: int = 60) -> CouponSearchResult:
-        """Get the user's clipped coupons.
-
-        Fetches clipped coupons via SSR from the clipped-coupons page.
-
-        Args:
-            limit: Maximum coupons to return
-
-        Returns:
-            CouponSearchResult with clipped coupons
-        """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
-            logger.warning("Clipped coupons require authentication")
-            return CouponSearchResult(
-                coupons=[],
-                count=0,
-                total=0,
-                categories=[],
-            )
-
-        try:
-            return await self._fetch_clipped_coupons_ssr(auth_client, limit)
-        except Exception as e:
-            logger.error("Failed to fetch clipped coupons", error=str(e))
-            return CouponSearchResult(
-                coupons=[],
-                count=0,
-                total=0,
-                categories=[],
-            )
-
     async def select_store(
-        self, store_id: str, ignore_conflicts: bool = False
+        self, store_id: str
     ) -> dict[str, Any]:
         """Change the active store via GraphQL mutation with verification.
 
         This calls the SelectPickupFulfillment mutation which changes
-        the user's active store on HEB's backend, then verifies the
-        change actually took effect by checking the cart's store.
+        the user's active store on HEB's backend.
 
         Args:
             store_id: The store ID to switch to
-            ignore_conflicts: If True, force store change even if cart has
-                conflicts (items unavailable, price changes). Default False.
 
         Returns:
             Result dict with:
             - success: True only if store actually changed (verified)
             - error: True if store change failed or couldn't be verified
             - code: Error code for programmatic handling
-            - verified: True if change was verified via get_cart()
         """
         auth_client = await self._get_authenticated_client()
         if not auth_client:
@@ -2218,107 +1839,23 @@ class HEBGraphQLClient:
                 {
                     "fulfillmentType": "PICKUP",
                     "pickupStoreId": store_id,
-                    "ignoreCartConflicts": ignore_conflicts,
                     "storeId": int(store_id),
                     "userIsLoggedIn": True,
                 },
             )
 
             fulfillment_data = result.get("selectPickupFulfillment", {})
-            logger.debug(
-                "SelectPickupFulfillment response",
+            logger.info(
+                "Store change mutation succeeded",
                 store_id=store_id,
                 response=fulfillment_data,
             )
 
-            # VERIFY: Check if store actually changed by fetching cart
-            # This is the key fix - don't trust the mutation response alone
-            cart = await self.get_cart()
-            if cart.get("error"):
-                logger.warning(
-                    "Could not verify store change - cart fetch failed",
-                    store_id=store_id,
-                    cart_error=cart,
-                )
-                return {
-                    "error": True,
-                    "code": "VERIFICATION_FAILED",
-                    "message": "Store change could not be verified - cart fetch failed",
-                    "store_id": store_id,
-                    "mutation_response": fulfillment_data,
-                }
-
-            # Extract actual store from cart response
-            # Cart structure: cartV2.fulfillment.store.id
-            cart_v2 = cart.get("cartV2") or cart.get("cart") or {}
-            fulfillment = cart_v2.get("fulfillment") or {}
-            store_info = fulfillment.get("store") or {}
-            actual_store_id = str(store_info.get("id", ""))
-
-            # Also check pickupStore as alternative location
-            if not actual_store_id:
-                pickup_store = fulfillment.get("pickupStore") or {}
-                actual_store_id = str(pickup_store.get("id", ""))
-
-            # If still no store found, check top-level storeId
-            if not actual_store_id:
-                actual_store_id = str(cart_v2.get("storeId", ""))
-
-            logger.debug(
-                "Store verification",
-                requested=store_id,
-                actual=actual_store_id,
-                cart_fulfillment=fulfillment,
-            )
-
-            # Compare requested vs actual
-            if actual_store_id == store_id:
-                logger.info(
-                    "Store change verified successful",
-                    store_id=store_id,
-                    verified=True,
-                )
-                return {
-                    "success": True,
-                    "store_id": store_id,
-                    "message": f"Store changed to {store_id}",
-                    "verified": True,
-                }
-            else:
-                # Store didn't change - likely cart conflict
-                logger.warning(
-                    "Store change verification failed",
-                    requested=store_id,
-                    actual=actual_store_id,
-                    ignore_conflicts=ignore_conflicts,
-                )
-
-                # Determine likely cause
-                if not ignore_conflicts:
-                    return {
-                        "error": True,
-                        "code": "CART_CONFLICT",
-                        "message": (
-                            f"Store change not applied - your cart may have items "
-                            "unavailable at the new store. Current store is still "
-                            f"{actual_store_id}."
-                        ),
-                        "expected_store": store_id,
-                        "actual_store": actual_store_id,
-                        "suggestion": "Try with ignore_conflicts=True to force the change, "
-                        "or clear your cart first.",
-                    }
-                else:
-                    return {
-                        "error": True,
-                        "code": "VERIFICATION_FAILED",
-                        "message": (
-                            f"Store change not applied even with ignore_conflicts=True. "
-                            f"Current store is still {actual_store_id}."
-                        ),
-                        "expected_store": store_id,
-                        "actual_store": actual_store_id,
-                    }
+            return {
+                "success": True,
+                "store_id": store_id,
+                "message": f"Store changed to {store_id}",
+            }
 
         except GraphQLError as e:
             error_msg = str(e)
@@ -2347,54 +1884,3 @@ class HEBGraphQLClient:
                 "store_id": store_id,
             }
 
-    @with_retry(config=RetryConfig(max_attempts=2, base_delay=0.5))
-    async def _fetch_clipped_coupons_ssr(
-        self,
-        client: httpx.AsyncClient,
-        limit: int = 60,
-    ) -> CouponSearchResult:
-        """Fetch clipped coupons via SSR page.
-
-        Args:
-            client: Authenticated httpx client
-            limit: Max results
-
-        Returns:
-            CouponSearchResult with clipped coupon data
-        """
-        self.circuit_breaker.check()
-
-        url = "https://www.heb.com/digital-coupon/clipped-coupons"
-        logger.debug("Fetching clipped coupons SSR", url=url)
-
-        try:
-            response = await client.get(url)
-            response.raise_for_status()
-
-            # Extract __NEXT_DATA__ JSON from HTML
-            match = re.search(
-                r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-                response.text,
-                re.DOTALL,
-            )
-
-            if not match:
-                logger.warning("No __NEXT_DATA__ found in clipped coupons response")
-                return CouponSearchResult(coupons=[], count=0, total=0, categories=[])
-
-            next_data = json.loads(match.group(1))
-            result = self._parse_coupon_ssr_data(next_data, limit)
-
-            self.circuit_breaker.record_success()
-            logger.info(
-                "Clipped coupons fetch successful",
-                count=result.count,
-                total=result.total,
-            )
-
-            return result
-
-        except httpx.HTTPError as e:
-            self.circuit_breaker.record_failure()
-            logger.error("Clipped coupons SSR fetch failed", error=str(e))
-            raise

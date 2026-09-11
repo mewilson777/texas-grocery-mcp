@@ -91,21 +91,19 @@ async def product_search(
 
     result_products = []
     for p in search_result.products:
-        # Always include both IDs at the top for cart operations
+        # Always include both IDs at the top
         product_data: dict[str, Any] = {
-            "product_id": p.product_id,  # Short ID - REQUIRED for cart_add
-            "sku": p.sku,                # Long ID - REQUIRED for cart_add as sku_id
+            "product_id": p.product_id,  # Short ID
+            "sku": p.sku,                # Long ID
             "name": p.name,
             "price": p.price,
             "available": p.available,
-            "has_coupon": p.has_coupon,  # Coupon availability flag
         }
 
         # Warn if product_id is missing (typeahead fallback)
         if not p.product_id or p.product_id.startswith("suggestion-"):
             product_data["_warning"] = (
-                "No product_id available - cannot add to cart. "
-                "Try a more specific search or refresh session."
+                "No product_id available. Try a more specific search or refresh session."
             )
 
         if field_set in ("standard", "all"):
@@ -184,18 +182,6 @@ async def product_search(
             ),
             "empty": sum(1 for a in search_result.attempts if a.result == "empty"),
             "errors": sum(1 for a in search_result.attempts if a.result == "error"),
-        }
-
-    # Add cart usage instructions when products with valid IDs are found
-    valid_products = [
-        p for p in result_products
-        if p.get("product_id") and not str(p.get("product_id", "")).startswith("suggestion-")
-    ]
-    if valid_products:
-        result["cart_usage"] = {
-            "instructions": "To add products to cart, use both IDs:",
-            "example": "cart_add(product_id=<product_id>, sku_id=<sku>, quantity=1, confirm=True)",
-            "note": "product_id is the shorter ID, sku is the longer ID",
         }
 
     return result
@@ -277,8 +263,8 @@ async def product_search_batch(
             product_list = []
             for p in search_result.products[:limit_per_query]:
                 product_dict = {
-                    "product_id": p.product_id,  # Short ID for cart_add
-                    "sku": p.sku,                # Long ID for cart_add as sku_id
+                    "product_id": p.product_id,  # Short ID
+                    "sku": p.sku,                # Long ID
                     "name": p.name,
                     "price": p.price,
                     "available": p.available,
@@ -287,7 +273,7 @@ async def product_search_batch(
                 }
                 # Warn if IDs are missing (typeahead fallback)
                 if not p.product_id or p.product_id.startswith("suggestion-"):
-                    product_dict["_warning"] = "Cannot add to cart - missing product_id"
+                    product_dict["_warning"] = "Missing product_id"
                 product_list.append(product_dict)
 
             results.append({
@@ -410,15 +396,6 @@ async def product_get(
         result["_meta"] = {
             "store_id": effective_store_id,
             "source": "ssr_product_detail",
-        }
-
-        # Add cart usage hint
-        result["cart_usage"] = {
-            "instructions": "To add this product to cart:",
-            "example": (
-                f"cart_add(product_id='{details.product_id}', sku_id='{details.sku}', "
-                "quantity=1, confirm=True)"
-            ),
         }
 
         return result

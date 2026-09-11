@@ -40,18 +40,11 @@ Session data (cookies, tokens) is stored in `~/.texas-grocery-mcp/auth.json`. Th
 
 ### Human-in-the-Loop
 
-Cart and coupon operations require explicit confirmation to prevent:
-
-- Accidental purchases
-- Unintended coupon clipping
-- Rate limit abuse
-
 ## Best Practices for Users
 
 1. **Keep dependencies updated**: Run `pip install --upgrade texas-grocery-mcp` regularly
 2. **Protect auth files**: Ensure `~/.texas-grocery-mcp/` has appropriate permissions (700)
 3. **Use environment variables**: Store sensitive configuration in environment variables, not config files
-4. **Review cart operations**: Always verify cart_add confirmations before approving
 
 ## Supported Versions
 

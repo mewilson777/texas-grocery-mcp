@@ -204,7 +204,7 @@ def check_auth() -> dict[str, Any]:
     return {
         "authenticated": False,
         "auth_required": True,
-        "message": "Login required for cart operations",
+        "message": "Login required for this operation",
         "instructions": get_auth_instructions(),
     }
 
@@ -750,7 +750,7 @@ def ensure_session(func: Callable[P, Awaitable[ToolResult]]) -> Callable[P, Awai
 
     Usage:
         @ensure_session
-        async def cart_add(...):
+        async def store_change(...):
             ...
     """
 

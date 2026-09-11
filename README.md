@@ -6,7 +6,7 @@
 
 > 🤖 Let AI do your grocery shopping! An MCP server that connects Claude to H-E-B grocery stores.
 
-**Search products, manage your cart, clip coupons, and more — all through natural conversation.**
+**Search products and more — all through natural conversation.**
 
 ⚠️ This project is **not affiliated with H-E-B**. It uses unofficial web APIs and browser automation against HEB.com; use responsibly and ensure your usage complies with applicable terms and laws.
 
@@ -18,9 +18,7 @@
 |---------|-------------|
 | 🏪 **Store Search** | Find HEB stores by address or zip code |
 | 🔍 **Product Search** | Search products with pricing and availability |
-| 🛒 **Cart Management** | Add/remove items with human-in-the-loop confirmation |
 | 📋 **Product Details** | Ingredients, nutrition facts, allergens, warnings |
-| 🎟️ **Digital Coupons** | List, search, and clip coupons to save money |
 | 🔄 **Auto Session Refresh** | Handles bot detection automatically (~15 seconds) |
 
 ---
@@ -44,7 +42,7 @@ This enables **fast auto-refresh** (~15 seconds) using an embedded browser.
 
 ### Prerequisites
 
-For cart operations and session management, you'll also need **Playwright MCP**:
+For store changes and session management, you'll also need **Playwright MCP**:
 
 ```bash
 npm install -g @anthropic-ai/mcp-playwright
@@ -122,28 +120,6 @@ The `product_get` tool returns:
 - 🌿 **Dietary Attributes** - Gluten-free, organic, vegan, kosher, etc.
 - 📍 **Store Location** - Aisle or section
 
-### 🛒 Adding to Cart
-
-```
-User: Add 2 gallons of milk to my cart
-
-Agent uses: cart_add(product_id="123456", quantity=2)
-# Returns preview for confirmation
-
-Agent uses: cart_add(product_id="123456", quantity=2, confirm=true)
-# ✅ Added to cart!
-```
-
-### 🎟️ Clipping Coupons
-
-```
-User: Find coupons for cereal
-
-Agent uses: coupon_search(query="cereal")
-Agent uses: coupon_clip(coupon_id="ABC123", confirm=true)
-# ✅ Coupon clipped!
-```
-
 ---
 
 ## 🔐 Session Management
@@ -186,23 +162,6 @@ Agent uses: session_save_credentials(email="you@email.com", password="...")
 | `product_search` | Search products with pricing |
 | `product_search_batch` | Search multiple products (up to 20) |
 | `product_get` | Get detailed product info |
-
-### 🛒 Cart Tools
-| Tool | Description |
-|------|-------------|
-| `cart_check_auth` | Check authentication status |
-| `cart_get` | View cart contents |
-| `cart_add` | Add item (requires confirmation) |
-| `cart_add_many` | Bulk add multiple items |
-| `cart_remove` | Remove item |
-
-### 🎟️ Coupon Tools
-| Tool | Description |
-|------|-------------|
-| `coupon_list` | List available coupons |
-| `coupon_search` | Search coupons by keyword |
-| `coupon_clip` | Clip a coupon |
-| `coupon_clipped` | List your clipped coupons |
 
 ### 🔐 Session Tools
 | Tool | Description |
