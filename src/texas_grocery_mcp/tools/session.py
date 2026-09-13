@@ -14,6 +14,7 @@ from texas_grocery_mcp.auth.browser_refresh import (
     refresh_session_with_browser,
 )
 from texas_grocery_mcp.auth.credentials import CredentialError, CredentialStore
+from texas_grocery_mcp.auth.cookies_txt import CookiesTxtParseError, load_cookies_text
 from texas_grocery_mcp.auth.session import (
     check_session_freshness,
     get_session_info,
@@ -484,3 +485,57 @@ def _mask_email(email: str) -> str:
         masked_local = local[0] + "*" * (len(local) - 2) + local[-1]
 
     return f"{masked_local}@{domain}"
+
+def session_load_cookies(cookies_txt: str) -> dict[str, Any]:
+    """Load HEB session cookies from raw Netscape ``cookies.txt`` content.
+
+    This is the recommended way to authenticate the MCP against HEB. Because
+    HEB uses Kasada (reese84) bot detection that blocks headless browsers,
+    the reliable workflow is:
+
+    1. In your real browser, log in to https://www.heb.com and complete any
+       verification prompts as you normally would.
+    2. Use a browser extension such as "Get cookies.txt LOCALLY" (Chrome or
+       Firefox) to export cookies for ``heb.com``.
+    3. Call this tool with the exported text pasted directly into
+       ``cookies_txt`` (not a file path). It converts the Netscape format
+       into the Playwright storage-state layout the rest of the MCP expects
+       and writes it to your configured ``auth.json``. Passing raw content
+       instead of a path means this works no matter where the MCP server is
+       running relative to the exported file.
+
+    Re-run whenever your session stops working (typically when HEB rotates
+    the reese84 token, roughly every ~10 minutes of active use).
+
+    Args:
+        cookies_txt: Full contents of the exported Netscape ``cookies.txt``
+            file (not a file path).
+
+    Returns:
+        Dict with ``cookies_written``, ``skipped_rows``, ``auth_path``, etc.
+        On failure, returns ``{"success": False, "error": ...}``.
+    """
+    settings = get_settings()
+    auth_path = Path(settings.auth_state_path).expanduser()
+
+    try:
+        result = load_cookies_text(cookies_txt, auth_path)
+    except CookiesTxtParseError as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "suggestion": (
+                "This doesn't look like Netscape cookies.txt content. Re-export "
+                "using a Netscape-format cookie extension."
+            ),
+        }
+
+    result["success"] = True
+    if result["cookies_written"] == 0:
+        result["warning"] = (
+            "Content parsed but contained no cookies for heb.com. Make sure you "
+            "exported cookies for the HEB domain (or check the export filter)."
+        )
+    else:
+        result["next_steps"] = "Call session_status to verify authentication succeeded."
+    return result
