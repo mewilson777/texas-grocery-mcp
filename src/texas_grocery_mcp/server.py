@@ -13,6 +13,7 @@ from texas_grocery_mcp.tools.session import (
     session_clear_credentials,
     session_refresh,
     session_save_credentials,
+    session_load_cookies,
     session_save_instructions,
     session_status,
 )
@@ -159,6 +160,7 @@ mcp.tool(annotations={"readOnlyHint": True})(product_get)
 mcp.tool(annotations={"readOnlyHint": True})(session_status)
 mcp.tool(annotations={"readOnlyHint": True})(session_save_instructions)
 mcp.tool()(session_refresh)  # Uses embedded Playwright when available, falls back to commands
+mcp.tool()(session_load_cookies)  # Load cookies from Netscape cookies.txt export
 mcp.tool()(session_clear)
 mcp.tool()(session_save_credentials)  # Store HEB credentials for auto-login
 mcp.tool()(session_clear_credentials)  # Remove stored credentials
