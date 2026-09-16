@@ -148,6 +148,12 @@ async def product_search(
             f"Reason: {search_result.fallback_reason or 'SSR search unsuccessful'}. "
         )
         result["auth_required_for_full_data"] = not search_result.authenticated
+    elif search_result.data_source == "none":
+        result["note"] = (
+            "No products found via SSR search, and typeahead fallback is disabled. "
+            f"Reason: {search_result.fallback_reason or 'SSR search unsuccessful'}."
+        )
+        result["auth_required_for_full_data"] = not search_result.authenticated
 
     # Add security challenge information
     if search_result.security_challenge_detected:

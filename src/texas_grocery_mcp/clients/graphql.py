@@ -120,6 +120,7 @@ class HEBGraphQLClient:
         self._client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None
         self._build_id: str | None = None
+        self._typeahead_fallback_enabled = settings.typeahead_fallback_enabled
 
         # Initialize throttlers for rate limiting
         self._ssr_throttler = Throttler(
@@ -975,9 +976,10 @@ class HEBGraphQLClient:
                     )
                     continue
 
-            # If all variations failed, try using typeahead suggestions as queries
-            # Skip this if security challenge was detected - no point in trying more SSR requests
-            if not security_challenge_detected:
+            # If all variations failed, try using typeahead suggestions as queries.
+            # Skip this if security challenge was detected - no point in trying more
+            # SSR requests - or if typeahead fallback is disabled.
+            if self._typeahead_fallback_enabled and not security_challenge_detected:
                 try:
                     suggestions = await self.get_typeahead(query)
                     if suggestions:
@@ -1044,6 +1046,37 @@ class HEBGraphQLClient:
             attempts=attempts,
         )
 
+        # Get Playwright instructions if security challenge was detected
+        playwright_instructions = None
+        if security_challenge_detected:
+            playwright_instructions = self._get_playwright_search_instructions(query, store_id)
+
+        if not self._typeahead_fallback_enabled:
+            fallback_reason = (
+                f"{fallback_reason} - typeahead fallback disabled "
+                "(set TYPEAHEAD_FALLBACK_ENABLED=true to enable)"
+            )
+            logger.info(
+                "Product search found no results; typeahead fallback disabled",
+                query=query,
+                store_id=store_id,
+                fallback_reason=fallback_reason,
+            )
+            return ProductSearchResult(
+                products=[],
+                count=0,
+                query=query,
+                store_id=store_id,
+                data_source="none",
+                authenticated=auth_client is not None,
+                fallback_reason=fallback_reason,
+                security_challenge_detected=security_challenge_detected,
+                attempts=attempts,
+                search_url=search_url,
+                playwright_fallback_available=security_challenge_detected,
+                playwright_instructions=playwright_instructions,
+            )
+
         logger.info(
             "Product search using typeahead fallback",
             query=query,
@@ -1051,11 +1084,6 @@ class HEBGraphQLClient:
             fallback_reason=fallback_reason,
             security_challenge=security_challenge_detected,
         )
-
-        # Get Playwright instructions if security challenge was detected
-        playwright_instructions = None
-        if security_challenge_detected:
-            playwright_instructions = self._get_playwright_search_instructions(query, store_id)
 
         try:
             suggestions = await self.get_typeahead(query)

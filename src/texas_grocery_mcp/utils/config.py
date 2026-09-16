@@ -27,6 +27,17 @@ class Settings(BaseSettings):
         description="HEB GraphQL API endpoint",
     )
 
+    # Product Search
+    typeahead_fallback_enabled: bool = Field(
+        default=False,
+        description=(
+            "Allow product_search to fall back to HEB's typeahead/autocomplete "
+            "API when direct SSR search fails or no auth cookies are available. "
+            "When off, product_search returns no products instead of typeahead "
+            "suggestions."
+        ),
+    )
+
     # Auth State
     auth_state_path: Path = Field(
         default=Path("~/.texas-grocery-mcp/auth.json").expanduser(),
