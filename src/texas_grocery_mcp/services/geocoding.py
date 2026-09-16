@@ -1,6 +1,7 @@
 """Geocoding service using Nominatim (OpenStreetMap)."""
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +16,12 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Nominatim requires a valid User-Agent. They block custom app names
 # without real contact info. Using curl format as a pragmatic workaround.
 USER_AGENT = "curl/8.7.1"
+
+# Matches a trailing 5-digit zip (optionally with a -NNNN extension) at the
+# end of an address string, e.g. "...Round Rock, TX 78681-3922" -> "78681".
+# Anchored to the end so it doesn't mistake a house number earlier in the
+# string (e.g. "16900 Ranch Road 620") for a zip code.
+_TRAILING_ZIP_RE = re.compile(r"(\d{5})(?:-\d{4})?\s*$")
 
 
 @dataclass
@@ -196,6 +203,29 @@ class GeocodingService:
         }
 
         return state_abbrevs.get(state.lower(), state)
+
+    @staticmethod
+    def extract_trailing_zip(address: str) -> str | None:
+        """Pull a trailing 5-digit zip code out of a raw address string.
+
+        Nominatim's free-form parser frequently fails on rural highway
+        addresses (e.g. "16900 Ranch Road 620, Round Rock, TX 78681-3922") -
+        it doesn't recognize "Ranch Road 620" and returns no results at all.
+        When that happens we still usually have a perfectly good zip code
+        sitting at the end of the string, which both Nominatim and HEB's
+        store search handle fine on their own.
+
+        Args:
+            address: Raw address string as supplied by the caller
+
+        Returns:
+            The 5-digit zip code if one is found at the end of the string,
+            else None
+        """
+        if not address:
+            return None
+        match = _TRAILING_ZIP_RE.search(address.strip())
+        return match.group(1) if match else None
 
     @staticmethod
     def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

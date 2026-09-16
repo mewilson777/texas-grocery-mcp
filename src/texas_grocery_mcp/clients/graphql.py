@@ -417,8 +417,16 @@ class HEBGraphQLClient:
         if geocoding_result:
             query_variations = geocoding_result.get_query_variations(address)
         else:
-            # Geocoding failed - just try the original query
-            query_variations = [address]
+            # Geocoding failed (Nominatim often can't parse rural highway
+            # addresses like "16900 Ranch Road 620"). If there's a zip code
+            # at the end of the raw string, try that first - it's usually
+            # geocodable and HEB's store search handles it directly - then
+            # fall back to the original query as typed.
+            query_variations = []
+            extracted_zip = GeocodingService.extract_trailing_zip(address)
+            if extracted_zip:
+                query_variations.append(extracted_zip)
+            query_variations.append(address)
 
         # Step 3: Try each query variation until we get results
         stores: list[Store] = []
