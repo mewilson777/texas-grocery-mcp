@@ -57,7 +57,7 @@ class PersistedQueryNotFoundError(Exception):
 PERSISTED_QUERIES = {
     "ShopNavigation": "0e669423cef683226cb8eb295664619c8e0f95945734e0a458095f51ee89efb3",
     "alertEntryPoint": "3e3ccd248652e8fce4674d0c5f3f30f2ddc63da277bfa0ff36ea9420e5dffd5e",
-    "typeaheadContent": "1ed956c0f10efcfc375321f33c40964bc236fff1397a4e86b7b53cb3b18ad329",
+    "typeaheadContent": "2c4ce4e9058185bc75dc3c24f3904e2c60cf7f15a7c316e6688dd7d7a8a22531",
     "StorePickerSearch": "67ba839c136f847c8a863a8c2eca09905c9340dba35733b1d330d1282e9e0076",
     # Store change mutation - changes the active pickup store
     "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
