@@ -28,7 +28,7 @@ _HTTPONLY_PREFIX = "#HttpOnly_"
 
 # Only these HEB domains are trusted; anything else (e.g. a tracker or
 # unrelated site swept up in a browser-wide export) is dropped.
-_ALLOWED_DOMAINS = {".heb.com", "www.heb.com"}
+_ALLOWED_DOMAINS = {".heb.com", "www.heb.com", "accounts.heb.com"}
 
 
 class CookiesTxtParseError(ValueError):

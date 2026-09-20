@@ -4,14 +4,18 @@ Supports both unauthenticated (typeahead) and authenticated (full product search
 modes. Authenticated mode uses browser session cookies for faster API access.
 """
 
-import json
 import re
 from typing import Any, cast
 
 import httpx
 import structlog
 
-from texas_grocery_mcp.auth.session import get_httpx_cookies, is_authenticated
+from texas_grocery_mcp.auth.browser_fingerprint import ACCEPT_LANGUAGE, DEFAULT_USER_AGENT
+from texas_grocery_mcp.auth.browser_session import (
+    BrowserSessionUnavailableError,
+    get_browser_session,
+)
+from texas_grocery_mcp.auth.session import is_authenticated
 from texas_grocery_mcp.models import (
     GeocodedLocation,
     NutrientInfo,
@@ -55,13 +59,20 @@ class PersistedQueryNotFoundError(Exception):
 # Persisted Query Hashes (discovered via reverse engineering)
 # These may change when HEB deploys new code
 PERSISTED_QUERIES = {
-    "ShopNavigation": "0e669423cef683226cb8eb295664619c8e0f95945734e0a458095f51ee89efb3",
+    "ShopNavigation": "53197129989f3555e560f3d11a85ebff9a2abe9d9cf6f7f10a8c93feda9503b2",
     "alertEntryPoint": "3e3ccd248652e8fce4674d0c5f3f30f2ddc63da277bfa0ff36ea9420e5dffd5e",
     "typeaheadContent": "2c4ce4e9058185bc75dc3c24f3904e2c60cf7f15a7c316e6688dd7d7a8a22531",
     "StorePickerSearch": "67ba839c136f847c8a863a8c2eca09905c9340dba35733b1d330d1282e9e0076",
     # Store change mutation - changes the active pickup store
-    "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
+    "SelectPickupFulfillment": "9c9fa9e42d3ecfe4f55e1af5b6deb8e0df02394dcd86a3e0610b8d2f264c05bc",
 }
+
+# Sent by HEB's own frontend on every /graphql call; observed via HAR capture
+# 2026-09-19 to be present on all persisted-query requests regardless of
+# operation. Their edge (Imperva) may score/require these for bot detection,
+# so persisted queries send them even though nothing about the GraphQL
+# protocol itself requires them.
+APOLLO_CLIENT_NAME = "WebPlatform-Solar (Production)"
 
 # Well-known HEB stores (fallback for store search)
 KNOWN_STORES = {
@@ -102,13 +113,9 @@ class HEBGraphQLClient:
 
     # Standard headers for browser-like requests
     _BROWSER_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": DEFAULT_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Language": ACCEPT_LANGUAGE,
         "Origin": "https://www.heb.com",
         "Referer": "https://www.heb.com/",
     }
@@ -118,7 +125,6 @@ class HEBGraphQLClient:
         self.base_url = base_url or settings.heb_graphql_url
         self.circuit_breaker = CircuitBreaker("heb_api")
         self._client: httpx.AsyncClient | None = None
-        self._auth_client: httpx.AsyncClient | None = None
         self._build_id: str | None = None
         self._typeahead_fallback_enabled = settings.typeahead_fallback_enabled
 
@@ -162,57 +168,57 @@ class HEBGraphQLClient:
             )
         return self._client
 
-    async def _get_authenticated_client(self) -> httpx.AsyncClient | None:
-        """Get HTTP client with authentication cookies.
-
-        Returns:
-            Authenticated client if cookies available, None otherwise
-        """
-        if not is_authenticated():
-            return None
-
-        # Always recreate to get fresh cookies
-        if self._auth_client:
-            await self._auth_client.aclose()
-
-        cookies = get_httpx_cookies()
-        if not cookies:
-            return None
-
-        self._auth_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0),
-            headers=self._BROWSER_HEADERS,
-            cookies=cookies,
-            follow_redirects=True,
-        )
-
-        logger.debug("Created authenticated client", cookie_count=len(cookies))
-        return self._auth_client
-
     async def close(self) -> None:
         """Close HTTP clients."""
         if self._client:
             await self._client.aclose()
             self._client = None
-        if self._auth_client:
-            await self._auth_client.aclose()
-            self._auth_client = None
 
-    async def _get_build_id(self) -> str:
+    async def _get_build_id(self, allow_browser_bootstrap: bool = False) -> str:
         """Extract Next.js build ID from HEB homepage.
 
         The build ID is required for accessing _next/data endpoints.
         It changes with each deployment.
 
-        Uses authenticated client when available to bypass WAF challenges.
+        Read from the live browser page when one exists, since httpx gets
+        challenged on the homepage GET. The httpx path remains as a fallback
+        for unauthenticated use (typeahead), where no browser session is
+        running. The build ID is deployment-wide, not user-specific, so
+        either source is equivalent when both work.
+
+        Args:
+            allow_browser_bootstrap: Let this start a browser session if one
+                isn't running yet. Authenticated in-page callers pass True -
+                they need the browser regardless, and without it the httpx
+                fallback would just be challenged. Unauthenticated callers
+                leave it False so a typeahead lookup never launches Chrome.
         """
         if self._build_id:
             return self._build_id
 
-        # Prefer authenticated client to bypass WAF/security challenges
-        client = await self._get_authenticated_client()
-        if not client:
-            client = await self._get_client()
+        # Prefer the live browser. httpx is challenged on this plain homepage
+        # GET regardless of cookies (verified 2026-09-20 - Imperva returns its
+        # interstitial), and the browser already has the page loaded, so this
+        # is both more reliable and cheaper than a fresh request.
+        session = get_browser_session()
+        if session.has_live_session() or (allow_browser_bootstrap and is_authenticated()):
+            try:
+                build_id = await session.get_build_id()
+                if build_id:
+                    self._build_id = build_id
+                    logger.info("Extracted build ID from live browser page", build_id=build_id)
+                    return build_id
+            except BrowserSessionUnavailableError:
+                # An authenticated caller has no usable fallback - httpx would
+                # just be challenged - so surface this rather than masking it
+                # as a generic build-ID failure.
+                if allow_browser_bootstrap:
+                    raise
+                logger.debug("No browser session for build ID; falling back to httpx")
+            except Exception as e:
+                logger.debug("Could not read build ID from browser session", error=str(e))
+
+        client = await self._get_client()
 
         response = await client.get("https://www.heb.com")
         response.raise_for_status()
@@ -246,6 +252,21 @@ class HEBGraphQLClient:
             response_preview=response.text[:500] if response.text else "empty",
         )
         raise RuntimeError("Could not extract Next.js build ID from HEB homepage")
+
+    async def _get_apollo_headers(self) -> dict[str, str]:
+        """Headers HEB's own frontend sends on every persisted-query request.
+
+        Best-effort: the client-name is a static string, but the
+        client-version is the current Next.js build ID, which requires a
+        page fetch to extract. If that fetch fails, still send the client
+        name rather than failing the whole persisted query over it.
+        """
+        headers = {"apollographql-client-name": APOLLO_CLIENT_NAME}
+        try:
+            headers["apollographql-client-version"] = await self._get_build_id()
+        except Exception as e:
+            logger.debug("Could not attach apollographql-client-version", error=str(e))
+        return headers
 
     @with_retry(config=RetryConfig(max_attempts=3, base_delay=1.0))
     async def _execute_persisted_query(
@@ -287,7 +308,9 @@ class HEBGraphQLClient:
             }
 
             try:
-                response = await client.post(self.base_url, json=payload)
+                response = await client.post(
+                    self.base_url, json=payload, headers=await self._get_apollo_headers()
+                )
                 response.raise_for_status()
 
                 data: Any = response.json()
@@ -318,53 +341,6 @@ class HEBGraphQLClient:
                     error=str(e),
                 )
                 raise
-
-    @with_retry(config=RetryConfig(max_attempts=3, base_delay=1.0))
-    async def _fetch_nextjs_data(
-        self,
-        path: str,
-        params: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        """Fetch data from Next.js _next/data endpoint.
-
-        Args:
-            path: The page path (e.g., "search" for /search)
-            params: Query parameters
-
-        Returns:
-            Page props data
-        """
-        self.circuit_breaker.check()
-
-        build_id = await self._get_build_id()
-        client = await self._get_client()
-
-        url = f"https://www.heb.com/_next/data/{build_id}/en/{path}.json"
-
-        try:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-
-            data: Any = response.json()
-            self.circuit_breaker.record_success()
-
-            # Next.js data is wrapped in pageProps
-            if not isinstance(data, dict):
-                return {}
-
-            page_props = data.get("pageProps")
-            if isinstance(page_props, dict):
-                return cast(dict[str, Any], page_props)
-            return cast(dict[str, Any], data)
-
-        except httpx.HTTPError as e:
-            self.circuit_breaker.record_failure()
-            logger.error(
-                "Next.js data fetch failed",
-                path=path,
-                error=str(e),
-            )
-            raise
 
     async def search_stores(
         self,
@@ -535,7 +511,9 @@ class HEBGraphQLClient:
 
         stores = []
         # API returns data in searchStoresByAddress.stores (not storeSearch)
-        store_search_data = data.get("searchStoresByAddress", {}) or data.get("StoreSearchResponse", {})
+        store_search_data = data.get("searchStoresByAddress", {}) or data.get(
+            "StoreSearchResponse", {}
+        )
         store_list = store_search_data.get("stores", [])
 
         for store_result in store_list:
@@ -725,10 +703,6 @@ class HEBGraphQLClient:
         ):
             variations.append(f"Meal Simple {query}")
 
-        # Add "H-E-B" prefix if not present
-        if "h-e-b" not in query_lower and "heb" not in query_lower:
-            variations.append(f"H-E-B {query}")
-
         # Remove duplicates while preserving order
         seen = set()
         unique_variations = []
@@ -752,10 +726,11 @@ class HEBGraphQLClient:
         Returns:
             True if response appears to be a security challenge
         """
+        # All lowercase: these are matched against a lowercased body, so any
+        # uppercase here would silently never match.
         challenge_indicators = [
             "incapsula",
             "reese84",
-            "_Incapsula_Resource",
             "challenge-platform",
             "cf-browser-verification",
             "captcha",
@@ -763,6 +738,7 @@ class HEBGraphQLClient:
             "access denied",
             "please verify you are a human",
             "enable javascript and cookies",
+            "pardon our interruption",
         ]
         html_lower = html.lower()
         return any(indicator in html_lower for indicator in challenge_indicators)
@@ -904,16 +880,15 @@ class HEBGraphQLClient:
         security_challenge_detected = False
         search_url = f"https://www.heb.com/search?q={query.replace(' ', '+')}"
 
-        # Try authenticated search first
-        auth_client = await self._get_authenticated_client()
-        if auth_client:
+        # Try authenticated search first, issued from the live browser session.
+        if is_authenticated():
             # Generate query variations to try
             query_variations = self._generate_query_variations(query)
 
             for variation in query_variations:
                 try:
                     products, was_challenge = await self._search_products_ssr(
-                        auth_client, variation, store_id, limit
+                        variation, store_id, limit
                     )
 
                     if was_challenge:
@@ -962,6 +937,17 @@ class HEBGraphQLClient:
                             result="empty",
                         ))
 
+                except BrowserSessionUnavailableError as e:
+                    # Every variation would fail identically - don't burn the rest.
+                    attempts.append(ProductSearchAttempt(
+                        query=variation,
+                        method="ssr",
+                        result="error",
+                        error_detail=str(e),
+                    ))
+                    logger.warning("No authenticated browser session available", error=str(e))
+                    break
+
                 except Exception as e:
                     attempts.append(ProductSearchAttempt(
                         query=variation,
@@ -986,7 +972,7 @@ class HEBGraphQLClient:
                         for suggestion in suggestions[:2]:  # Try top 2 suggestions
                             try:
                                 products, was_challenge = await self._search_products_ssr(
-                                    auth_client, suggestion, store_id, limit
+                                    suggestion, store_id, limit
                                 )
 
                                 if was_challenge:
@@ -1041,7 +1027,7 @@ class HEBGraphQLClient:
 
         # Fallback to typeahead suggestions only
         fallback_reason = self._determine_fallback_reason(
-            was_authenticated=auth_client is not None,
+            was_authenticated=is_authenticated(),
             security_challenge=security_challenge_detected,
             attempts=attempts,
         )
@@ -1068,7 +1054,7 @@ class HEBGraphQLClient:
                 query=query,
                 store_id=store_id,
                 data_source="none",
-                authenticated=auth_client is not None,
+                authenticated=is_authenticated(),
                 fallback_reason=fallback_reason,
                 security_challenge_detected=security_challenge_detected,
                 attempts=attempts,
@@ -1095,7 +1081,7 @@ class HEBGraphQLClient:
                 query=query,
                 store_id=store_id,
                 data_source="typeahead_suggestions",
-                authenticated=auth_client is not None,
+                authenticated=is_authenticated(),
                 fallback_reason=fallback_reason,
                 security_challenge_detected=security_challenge_detected,
                 attempts=attempts,
@@ -1133,7 +1119,7 @@ class HEBGraphQLClient:
             query=query,
             store_id=store_id,
             data_source="typeahead_suggestions",
-            authenticated=auth_client is not None,
+            authenticated=is_authenticated(),
             fallback_reason=fallback_reason,
             security_challenge_detected=security_challenge_detected,
             attempts=attempts,
@@ -1178,18 +1164,8 @@ class HEBGraphQLClient:
             )
             return cached
 
-        # Pre-fetch build ID before getting auth client
-        # (prevents client lifecycle issues since _get_build_id may create a client)
-        await self._get_build_id()
-
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
-            logger.warning("No authenticated client for product details")
-            # Try with unauthenticated client as fallback
-            auth_client = await self._get_client()
-
         try:
-            details = await self._get_product_details_ssr(auth_client, product_id)
+            details = await self._get_product_details_ssr(product_id)
             if details:
                 # Cache the result
                 self._product_details_cache.set(cache_key, details)
@@ -1222,13 +1198,15 @@ class HEBGraphQLClient:
     @with_retry(config=RetryConfig(max_attempts=2, base_delay=0.5))
     async def _get_product_details_ssr(
         self,
-        client: httpx.AsyncClient,
         product_id: str,
     ) -> ProductDetails | None:
-        """Fetch product details via SSR data endpoint.
+        """Fetch product details via the SSR data endpoint, in-browser.
+
+        Same endpoint family (and same WAF treatment) as
+        :meth:`_search_products_ssr` - see its docstring for why this runs
+        inside the page rather than over httpx.
 
         Args:
-            client: HTTP client (authenticated preferred)
             product_id: Product ID to fetch
 
         Returns:
@@ -1239,34 +1217,37 @@ class HEBGraphQLClient:
             self.circuit_breaker.check()
 
             # Get build ID for SSR endpoint
-            build_id = await self._get_build_id()
+            build_id = await self._get_build_id(allow_browser_bootstrap=True)
 
             url = f"https://www.heb.com/_next/data/{build_id}/en/product-detail/{product_id}.json"
             logger.debug("Fetching product details SSR", url=url, product_id=product_id)
 
             try:
-                response = await client.get(url)
+                session = get_browser_session()
+                data, status, text = await session.get_json(
+                    url, headers={"Accept": "*/*", "x-nextjs-data": "1"}
+                )
 
                 # 404 means product doesn't exist
-                if response.status_code == 404:
+                if status == 404:
                     logger.info("Product not found", product_id=product_id)
                     return None
 
-                response.raise_for_status()
-
-                # Check for security challenge
-                if response.headers.get(
-                    "content-type", ""
-                ).startswith("text/html") and self._detect_security_challenge(
-                    response.text
-                ):
-                    logger.warning(
-                        "Security challenge detected in product details response",
-                        product_id=product_id,
-                    )
+                if data is None:
+                    if self._detect_security_challenge(text):
+                        logger.warning(
+                            "Security challenge detected in product details response",
+                            product_id=product_id,
+                        )
+                    else:
+                        logger.error(
+                            "Product details returned a non-JSON body",
+                            product_id=product_id,
+                            status=status,
+                            snippet=text[:200],
+                        )
+                    self.circuit_breaker.record_failure()
                     return None
-
-                data = response.json()
 
                 # Try standard Next.js SSR structure first
                 product_data = data.get("pageProps", {}).get("product")
@@ -1292,14 +1273,6 @@ class HEBGraphQLClient:
                 self.circuit_breaker.record_success()
                 return self._parse_product_details(product_data)
 
-            except httpx.HTTPStatusError as e:
-                logger.error(
-                    "HTTP error fetching product details",
-                    product_id=product_id,
-                    status=e.response.status_code,
-                )
-                self.circuit_breaker.record_failure()
-                return None
             except Exception as e:
                 logger.error(
                     "Error fetching product details",
@@ -1503,18 +1476,28 @@ class HEBGraphQLClient:
     @with_retry(config=RetryConfig(max_attempts=2, base_delay=0.5))
     async def _search_products_ssr(
         self,
-        client: httpx.AsyncClient,
         query: str,
         store_id: str,
         limit: int = 20,
     ) -> tuple[list[Product], bool]:
-        """Search products using authenticated SSR page fetch.
+        """Search products using the authenticated Next.js data endpoint.
 
-        Fetches the search results page HTML and extracts product data
-        from the embedded __NEXT_DATA__ JSON.
+        A real HEB.com session doesn't do a full page load per search - it
+        fetches /_next/data/{build_id}/en/search.json?q=..., which returns
+        pageProps directly as JSON (no HTML/__NEXT_DATA__ scraping needed).
+        Confirmed against a HAR capture of a live browser search on
+        2026-09-19: this is the actual request an authenticated browser
+        sends, whereas GETting /search?q=... as a full document is a
+        synthetic request pattern a real browser rarely performs per
+        search and that HEB's WAF may treat with more suspicion.
+
+        Issued from inside the live authenticated page rather than over
+        httpx: on 2026-09-20 the identical URL with the identical cookies
+        returned Imperva's interstitial over httpx and HTTP 200 with full
+        results in-page. httpx cannot reproduce Chrome's TLS/h2 fingerprint,
+        so this is not fixable with headers.
 
         Args:
-            client: Authenticated httpx client with cookies
             query: Search query
             store_id: Store ID (used for context)
             limit: Maximum results to return
@@ -1525,54 +1508,50 @@ class HEBGraphQLClient:
         async with self._ssr_throttler:
             self.circuit_breaker.check()
 
-            url = f"https://www.heb.com/search?q={query.replace(' ', '+')}"
-            logger.debug("Fetching SSR search results", url=url)
+            build_id = await self._get_build_id(allow_browser_bootstrap=True)
+            q = query.replace(" ", "+")
+            url = f"https://www.heb.com/_next/data/{build_id}/en/search.json?q={q}"
+            logger.debug("Fetching search results via browser session", url=url)
 
-            try:
-                response = await client.get(url)
-                response.raise_for_status()
+            session = get_browser_session()
+            data, status, text = await session.get_json(
+                url, headers={"Accept": "*/*", "x-nextjs-data": "1"}
+            )
 
-                # Check for security challenge before parsing
-                if self._detect_security_challenge(response.text):
+            if data is None:
+                # Non-JSON body: either a WAF challenge or an unexpected error page.
+                if self._detect_security_challenge(text):
                     logger.warning(
-                        "Security challenge detected in SSR response",
+                        "Security challenge detected in search response",
                         query=query,
-                        response_length=len(response.text),
+                        status=status,
                     )
                     self.circuit_breaker.record_failure()
                     return [], True
 
-                # Extract __NEXT_DATA__ JSON from HTML
-                match = re.search(
-                    r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-                    response.text,
-                    re.DOTALL,
-                )
-
-                if not match:
-                    logger.warning(
-                        "No __NEXT_DATA__ found in response",
-                        query=query,
-                        response_length=len(response.text),
-                    )
-                    return [], False
-
-                next_data = json.loads(match.group(1))
-                products = self._parse_ssr_products(next_data, limit)
-
-                self.circuit_breaker.record_success()
-                logger.info(
-                    "SSR product search successful",
-                    query=query,
-                    result_count=len(products),
-                )
-
-                return products, False
-
-            except httpx.HTTPError as e:
                 self.circuit_breaker.record_failure()
-                logger.error("SSR search request failed", query=query, error=str(e))
-                raise
+                logger.error(
+                    "Search returned a non-JSON body",
+                    query=query,
+                    status=status,
+                    snippet=text[:200],
+                )
+                raise GraphQLError([{"message": f"Search failed with HTTP {status}"}])
+
+            page_props = data.get("pageProps") if isinstance(data, dict) else None
+            if not isinstance(page_props, dict):
+                logger.warning("No pageProps found in search data response", query=query)
+                return [], False
+
+            # _parse_ssr_products expects the full __NEXT_DATA__ shape
+            # (props.pageProps.layout...); wrap the data endpoint's
+            # unwrapped pageProps to match.
+            products = self._parse_ssr_products({"props": {"pageProps": page_props}}, limit)
+
+            self.circuit_breaker.record_success()
+            logger.info("Product search successful", query=query, result_count=len(products))
+
+            return products, False
 
     def _parse_ssr_products(self, next_data: dict[str, Any], limit: int = 20) -> list[Product]:
         """Parse products from Next.js SSR data.
@@ -1767,16 +1746,18 @@ class HEBGraphQLClient:
             return []
 
     @with_retry(config=RetryConfig(max_attempts=3, base_delay=1.0))
-    async def _execute_persisted_query_with_client(
+    async def _execute_persisted_query_in_browser(
         self,
-        client: httpx.AsyncClient,
         operation_name: str,
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        """Execute a persisted GraphQL query with a specific client.
+        """Execute an authenticated persisted GraphQL query inside the page.
+
+        Account-scoped mutations (e.g. SelectPickupFulfillment) need the real
+        session's fingerprint, not just its cookies - see
+        :meth:`_search_products_ssr`.
 
         Args:
-            client: httpx client to use (may have cookies)
             operation_name: The name of the persisted operation
             variables: Query variables
 
@@ -1800,14 +1781,8 @@ class HEBGraphQLClient:
         }
 
         try:
-            response = await client.post(
-                self.base_url,
-                json=payload,
-                headers={"Content-Type": "application/json", "Accept": "application/json"},
-            )
-            response.raise_for_status()
-
-            data: Any = response.json()
+            session = get_browser_session()
+            data, status = await session.fetch_json(self.base_url, payload)
 
             if "errors" in data:
                 for error in data["errors"]:
@@ -1817,18 +1792,22 @@ class HEBGraphQLClient:
                         )
                 raise GraphQLError(data["errors"])
 
+            if status >= 400 or not data:
+                raise GraphQLError(
+                    [{"message": f"{operation_name} failed with HTTP {status}"}]
+                )
+
             self.circuit_breaker.record_success()
 
-            if isinstance(data, dict):
-                payload_data = data.get("data")
-                if isinstance(payload_data, dict):
-                    return cast(dict[str, Any], payload_data)
+            payload_data = data.get("data")
+            if isinstance(payload_data, dict):
+                return cast(dict[str, Any], payload_data)
             return {}
 
-        except (httpx.HTTPError, GraphQLError) as e:
+        except GraphQLError as e:
             self.circuit_breaker.record_failure()
             logger.error(
-                "Persisted query with client failed",
+                "Persisted query in browser failed",
                 operation=operation_name,
                 error=str(e),
             )
@@ -1859,8 +1838,7 @@ class HEBGraphQLClient:
             - error: True if store change failed or couldn't be verified
             - code: Error code for programmatic handling
         """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
+        if not is_authenticated():
             return {
                 "error": True,
                 "code": "NOT_AUTHENTICATED",
@@ -1869,12 +1847,14 @@ class HEBGraphQLClient:
 
         try:
             # The mutation expects storeId as both string and int in different fields
-            result = await self._execute_persisted_query_with_client(
-                auth_client,
+            result = await self._execute_persisted_query_in_browser(
                 "SelectPickupFulfillment",
                 {
                     "fulfillmentType": "PICKUP",
                     "pickupStoreId": store_id,
+                    # Required Boolean! - the schema rejects the mutation
+                    # without it. Matches what heb.com's own client sends.
+                    "ignoreCartConflicts": False,
                     "storeId": int(store_id),
                     "userIsLoggedIn": True,
                 },

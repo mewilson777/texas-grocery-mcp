@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
 
 import structlog
 from fastmcp import FastMCP
@@ -11,9 +12,9 @@ from texas_grocery_mcp.tools.product import product_get, product_search, product
 from texas_grocery_mcp.tools.session import (
     session_clear,
     session_clear_credentials,
+    session_load_cookies,
     session_refresh,
     session_save_credentials,
-    session_load_cookies,
     session_save_instructions,
     session_status,
 )
@@ -80,68 +81,108 @@ async def lifespan(app: FastMCP) -> AsyncIterator[None]:
 
     yield  # Server runs here
 
-    # Shutdown: cleanup if needed
+    # Shutdown: close the shared authenticated browser. Authenticated requests
+    # run inside a live Chrome that's kept open for the process lifetime, so
+    # without this it outlives the server.
     logger.info("MCP server shutting down")
+    try:
+        from texas_grocery_mcp.auth.browser_session import get_browser_session
+
+        await get_browser_session().close()
+    except Exception as e:
+        logger.warning("Error closing browser session on shutdown", error=str(e))
 
 MCP_INSTRUCTIONS = """
 ## Texas Grocery MCP - Session Management
 
 This MCP requires an authenticated HEB.com session for most operations.
 
-### Before using the store_change tool:
-1. Call `session_status` to check authentication state
-2. If `authenticated: false` or `needs_refresh: true`, call `session_refresh`
-3. If session_refresh fails with headless mode, retry with `headless=False` for manual login
+### Recommended: manual cookie import (`session_load_cookies`)
+HEB's bot detection (Imperva/Incapsula) routinely blocks or rejects sessions
+established by automated browsers, including this MCP's own `session_refresh`
+tool - treat `session_refresh` as a best-effort fallback, not the primary
+path. The workflow that actually works:
+
+1. Ask the user to log in to https://www.heb.com in their own regular
+   browser and complete any verification prompts normally.
+2. Ask them to export cookies for `heb.com` with a browser extension such as
+   "Get cookies.txt LOCALLY".
+3. Call `session_load_cookies(cookies_txt=...)` with that exported text
+   pasted directly in (not a file path).
+4. Call `session_status` to confirm authentication succeeded.
+
+Re-run this whenever the session stops working - HEB rotates its bot-detection
+token roughly every ~10 minutes of active use, so expect to redo this
+periodically rather than expecting one export to last.
+
+Note: even a freshly-loaded, valid cookie set may still get rejected on
+write operations like `store_change` - HEB's WAF can distrust API calls that
+don't originate from the live browser session that established them. If
+`store_change` fails with 401 right after a successful `session_load_cookies`,
+that's this limitation, not a bad cookie export.
 
 ### Session states:
 - `authenticated: true, needs_refresh: false` → Ready to use all tools
 - `authenticated: true, refresh_recommended: true` → Works but consider refreshing soon
-- `authenticated: false` or `needs_refresh: true` → Must refresh before store_change
+- `authenticated: false` or `needs_refresh: true` → Needs `session_load_cookies` before store_change
 
 ### Tools that work WITHOUT authentication:
 - `store_search` - Find stores by address
+- `session_status` - Check session state
+
+### Tools that work unauthenticated but return better data with a session:
 - `product_search` / `product_search_batch` - Search products (uses local store default)
 - `product_get` - Get detailed product info (ingredients, nutrition, warnings)
-- `session_status` - Check session state
-- `session_refresh` - Refresh/login
+
+Without a session these return limited or empty results: full pricing and
+inventory come from HEB's authenticated pages. Check `data_source` and
+`authenticated` in the response - `data_source: "none"` means the search
+failed and typeahead fallback is disabled (the default).
+
+Important caveat: these product tools auto-refresh the session first, so if a
+*stale* session file exists, they can return `LOGIN_REQUIRED` or
+`HUMAN_ACTION_REQUIRED` instead of results rather than silently proceeding
+unauthenticated. If that happens, run `session_load_cookies` and retry. (With
+no session file at all, they proceed unauthenticated as described above.)
 
 ### Tools that REQUIRE authentication:
 - `store_change` - Change store on HEB.com account
 
 ### Typical workflow:
 1. `session_status` → Check if authenticated
-2. If not authenticated: `session_refresh(headless=False)` → User logs in via browser
+2. If not authenticated: walk the user through `session_load_cookies` (see above)
 3. `store_search("address")` → Find nearby stores
 4. `store_change(store_id)` → Set preferred store
 5. `product_search("query")` → Search for products
 
-### Automatic Login (Optional)
-Save your HEB credentials once for automatic login when sessions expire:
-
-1. `session_save_credentials(email, password)` → Store credentials securely
-2. Now `session_refresh` will auto-login when session expires
-3. `session_clear_credentials()` → Remove stored credentials if needed
-
-### Human Handoff (Login/CAPTCHA/2FA/WAF)
-When login requires human action (login form, CAPTCHA, 2FA, or a bot/WAF interstitial),
-`session_refresh` returns immediately with:
+### `session_refresh` (best-effort fallback only)
+Uses an embedded Playwright browser to log in or refresh tokens
+automatically. In practice this frequently fails against HEB's bot
+detection regardless of headless/visible mode - don't rely on it as the
+primary way to authenticate. If you do try it and it needs human input, it
+returns:
 - `status: "human_action_required"` - Clear indicator that human action is needed
 - `action: "login" | "captcha" | "2fa" | "waf"` - What type of action is needed
 - `screenshot_path: "/tmp/heb-login-<action>-123456.png"` - Screenshot of what's shown
 
-**Workflow when human action is required:**
-1. `session_refresh` returns with `status: "human_action_required"`
-2. Read the screenshot at `screenshot_path` to see what's shown
-3. Tell the user what's needed (log in, solve CAPTCHA, enter 2FA, or clear the WAF prompt)
-4. User completes the action in the browser window that's open
-5. User tells you "done" when finished
-6. Call `session_refresh()` again to continue the login
-7. Repeat until `status: "success"` or `status: "failed"`
+If it hands off, read the screenshot, tell the user what's needed, and call
+`session_refresh()` again after they act - but if it doesn't get past HEB's
+detection, fall back to `session_load_cookies` instead of retrying it repeatedly.
+
+### Automatic Login (Optional, same reliability caveats as session_refresh)
+`session_save_credentials(email, password)` stores credentials for
+`session_refresh` to auto-login with. Subject to the same bot-detection
+limitations described above.
 """
+
+try:
+    __version__ = version("texas-grocery-mcp")
+except PackageNotFoundError:  # pragma: no cover - source checkout without install
+    __version__ = "0.0.0+unknown"
 
 mcp = FastMCP(
     name="texas-grocery-mcp",
-    version="0.1.0",
+    version=__version__,
     instructions=MCP_INSTRUCTIONS,
     lifespan=lifespan,
 )

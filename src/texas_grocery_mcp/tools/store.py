@@ -163,7 +163,6 @@ async def store_change(
     # Look up store info if available
     store_name = None
     store_address = None
-    supports_curbside = True  # Default to True if unknown
     store = None
 
     cached_store = StateManager.get_cached_store(store_id)
@@ -171,12 +170,10 @@ async def store_change(
         store = cached_store
         store_name = store.name
         store_address = store.address
-        supports_curbside = store.supports_curbside
     elif store_id in KNOWN_STORES:
         store = KNOWN_STORES[store_id]
         store_name = store.name
         store_address = store.address
-        supports_curbside = store.supports_curbside
 
     # If not authenticated, set local default only
     if not is_authenticated():
@@ -190,8 +187,10 @@ async def store_change(
             "method": "local_only",
             "warning": "Not logged in - store set locally for product searches only.",
             "how_to_sync": (
-                "Run session_refresh to log in, then call store_change again to sync with "
-                "HEB.com."
+                "Authenticate first, then call store_change again to sync with HEB.com. "
+                "Recommended: session_load_cookies(cookies_txt=...) with an export from "
+                "a browser you're already logged into. session_refresh is a best-effort "
+                "fallback that HEB's bot detection often blocks."
             ),
         }
 

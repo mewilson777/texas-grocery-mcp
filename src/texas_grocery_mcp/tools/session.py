@@ -13,8 +13,8 @@ from texas_grocery_mcp.auth.browser_refresh import (
     is_playwright_available,
     refresh_session_with_browser,
 )
-from texas_grocery_mcp.auth.credentials import CredentialError, CredentialStore
 from texas_grocery_mcp.auth.cookies_txt import CookiesTxtParseError, load_cookies_text
+from texas_grocery_mcp.auth.credentials import CredentialError, CredentialStore
 from texas_grocery_mcp.auth.session import (
     check_session_freshness,
     get_session_info,
@@ -32,7 +32,8 @@ async def session_status() -> dict[str, Any]:
     Returns comprehensive session information:
     - authenticated: Whether session is valid
     - needs_refresh: Whether refresh is required now (token expired)
-    - refresh_recommended: Whether proactive refresh is advised (< 4 hours remaining)
+    - refresh_recommended: Whether proactive refresh is advised (less than
+      auto_refresh_threshold_hours of token life left)
     - time_remaining_hours: Hours until token expires
     - expires_at: ISO timestamp of expiration
     - message: Human-readable status

@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+- **Cart tools** (`cart_check_auth`, `cart_get`, `cart_add`, `cart_add_many`,
+  `cart_add_with_retry`, `cart_remove`) - HEB's bot detection made authenticated
+  write operations unreliable enough that they were withdrawn rather than shipped broken
+- **Coupon tools** (`coupon_list`, `coupon_search`, `coupon_categories`,
+  `coupon_clip`, `coupon_clipped`) - same reason
+- **Health tools** (`health_live`, `health_ready`) and the `observability/health.py`
+  module backing them
+- Unit test suite - the mocked HTTP fixtures no longer reflected HEB's live
+  behavior, which is what this project actually has to survive
+
+### Added
+- `session_load_cookies` - import a Netscape `cookies.txt` export from your own
+  browser session. This is now the **recommended** way to authenticate; see README
+- `session_save_instructions` - returns the manual authentication walkthrough
+- `TYPEAHEAD_FALLBACK_ENABLED` setting (default `false`) - controls whether
+  `product_search` falls back to HEB's autocomplete API when SSR search fails.
+  When off, a failed search returns zero products plus a `fallback_reason`
+  instead of placeholder suggestions with no real prices or product IDs
+
+### Changed
+- Store search and typeahead now track HEB's updated GraphQL persisted-query hashes
+- Improved geocoding address handling for bare zip codes and partial addresses
+- Browser fingerprint (user agent + Client Hints) is now derived from the launched
+  browser binary rather than hardcoded, so it stops contradicting itself
+- Documentation now leads with cookie import; `session_refresh` and
+  `session_save_credentials` are documented as best-effort fallbacks
+
 ## [0.1.2] - 2026-02-02
 
 ### Changed

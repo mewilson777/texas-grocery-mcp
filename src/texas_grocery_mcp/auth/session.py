@@ -41,7 +41,48 @@ _is_authenticated: bool = False
 # Key cookies required for authenticated requests
 REQUIRED_COOKIES = ["sat", "sst", "JSESSIONID"]
 # Cookies that indicate an active session
-SESSION_INDICATOR_COOKIES = ["sat", "DYN_USER_ID"]
+SESSION_INDICATOR_COOKIES = ["sat"]
+
+
+def find_heb_origin(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Find the HEB origin entry in a Playwright storage state.
+
+    Playwright writes ``origins`` in whatever order it collected them, so the
+    HEB entry is not guaranteed to be first - indexing ``origins[0]`` can miss
+    the localStorage that holds the reese84 token and make a freshly refreshed
+    session look unauthenticated.
+
+    Args:
+        state: Playwright storage state dict
+
+    Returns:
+        The origin dict for a heb.com origin, or None if there isn't one.
+    """
+    for origin in state.get("origins", []):
+        if "heb.com" in origin.get("origin", ""):
+            heb_origin: dict[str, Any] = origin
+            return heb_origin
+    return None
+
+
+def _get_heb_local_storage(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Get the HEB origin's localStorage items from a storage state."""
+    origin = find_heb_origin(state)
+    if origin is None:
+        return []
+    items: list[dict[str, Any]] = origin.get("localStorage", [])
+    return items
+
+
+def _read_reese84_data(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Parse the reese84 token payload out of the HEB origin's localStorage."""
+    for item in _get_heb_local_storage(state):
+        if item.get("name") == "reese84":
+            with suppress(json.JSONDecodeError):
+                data: dict[str, Any] = json.loads(item.get("value", "{}"))
+                return data
+            return None
+    return None
 
 
 def _reset_auth_state() -> None:
@@ -85,21 +126,7 @@ def _is_reese84_valid(state: dict[str, Any]) -> bool:
     Returns:
         True if reese84 token exists and is not expired, False otherwise
     """
-    # Extract localStorage from origins
-    origins = state.get("origins", [])
-    if not origins:
-        return False
-
-    local_storage = origins[0].get("localStorage", [])
-
-    # Find reese84 token
-    reese84_data: dict[str, Any] | None = None
-    for item in local_storage:
-        if item.get("name") == "reese84":
-            with suppress(json.JSONDecodeError):
-                reese84_data = json.loads(item.get("value", "{}"))
-            break
-
+    reese84_data = _read_reese84_data(state)
     if not reese84_data:
         return False
 
@@ -488,8 +515,20 @@ def get_session_info() -> dict[str, Any]:
     return info
 
 
-# Refresh threshold: recommend refresh when less than this many hours remain
-SESSION_REFRESH_THRESHOLD_HOURS = 4
+def _format_time_remaining(hours: float | None) -> str:
+    """Render remaining token life the way a reader thinks about it.
+
+    A reese84 token's whole life is ~12-15 minutes, so "0.2h remaining" is
+    both unreadable and easy to mistake for a session on its last legs.
+    """
+    if hours is None:
+        return "unknown"
+    minutes = hours * 60
+    if minutes < 1:
+        return "under a minute"
+    if hours < 1:
+        return f"{round(minutes)} min"
+    return f"{round(hours, 1)}h"
 
 
 def get_session_status() -> SessionStatus:
@@ -534,18 +573,8 @@ def get_session_status() -> SessionStatus:
             message=f"Auth file corrupted: {e}. Run session_refresh.",
         )
 
-    # Extract reese84 info from localStorage
-    local_storage: list[dict[str, Any]] = []
-    origins = auth_data.get("origins", [])
-    if origins:
-        local_storage = origins[0].get("localStorage", [])
-
-    reese84_data: dict[str, Any] | None = None
-    for item in local_storage:
-        if item.get("name") == "reese84":
-            with suppress(json.JSONDecodeError):
-                reese84_data = json.loads(item.get("value", "{}"))
-            break
+    # Extract reese84 info from the HEB origin's localStorage
+    reese84_data = _read_reese84_data(auth_data)
 
     # Calculate time remaining
     time_remaining_hours: float | None = None
@@ -584,8 +613,12 @@ def get_session_status() -> SessionStatus:
 
         if time_remaining_hours is not None:
             needs_refresh = time_remaining_hours <= 0
-            # Recommend refresh when < threshold hours remaining
-            refresh_recommended = time_remaining_hours < SESSION_REFRESH_THRESHOLD_HOURS
+            # Recommend a refresh exactly when auto-refresh would fire, so the
+            # advice matches what the server actually does. This used to be a
+            # hardcoded 4 hours, which - against a token that never has more
+            # than ~15 minutes of life - meant every session, however fresh,
+            # reported "expiring soon".
+            refresh_recommended = time_remaining_hours < settings.auto_refresh_threshold_hours
 
     # Check cookies for session validity
     cookies = auth_data.get("cookies", [])
@@ -607,15 +640,14 @@ def get_session_status() -> SessionStatus:
         else:
             message = "Session invalid. Run session_refresh."
     elif refresh_recommended:
-        hours = round(time_remaining_hours, 1) if time_remaining_hours else 0
-        message = f"Session valid but expiring soon ({hours}h remaining). Consider session_refresh."
-    else:
-        hours_str = (
-            str(round(time_remaining_hours, 1))
-            if time_remaining_hours is not None
-            else "unknown"
+        remaining = _format_time_remaining(time_remaining_hours)
+        message = (
+            f"Session valid but expiring soon ({remaining} remaining). "
+            "Consider session_refresh."
         )
-        message = f"Session healthy ({hours_str}h remaining)."
+    else:
+        remaining = _format_time_remaining(time_remaining_hours)
+        message = f"Session healthy ({remaining} remaining)."
 
     return SessionStatus(
         authenticated=authenticated,
@@ -636,8 +668,11 @@ async def auto_refresh_session_if_needed() -> dict[str, Any] | None:
     Called by the @ensure_session decorator before authenticated operations.
 
     Returns:
-        None if session is healthy or refresh succeeded.
-        Error dict if manual login is required.
+        None if the session is healthy, the refresh succeeded and was
+        verified, or the refresh failed in a way that shouldn't block the
+        call (the live browser session may still work) - failures are logged
+        rather than claimed as success.
+        Error dict if manual login or other human action is required.
     """
     global _last_auto_refresh_attempt
 
@@ -672,9 +707,13 @@ async def auto_refresh_session_if_needed() -> dict[str, Any] | None:
     # Prevent rapid retries
     current_time = time.time()
     if current_time - _last_auto_refresh_attempt < _auto_refresh_min_interval:
-        logger.debug(
-            "Skipping auto-refresh (too soon since last attempt)",
+        # The session is still stale here - we're just not allowed to retry
+        # yet. Say so, so this doesn't read as a healthy session downstream.
+        logger.warning(
+            "Skipping auto-refresh (too soon since last attempt) - session still stale",
             seconds_since_last=round(current_time - _last_auto_refresh_attempt, 1),
+            needs_refresh=status["needs_refresh"],
+            time_remaining_hours=status["time_remaining_hours"],
         )
         return None
 
@@ -706,9 +745,54 @@ async def auto_refresh_session_if_needed() -> dict[str, Any] | None:
             timeout=30000,
         )
 
+        # refresh_session_with_browser signals failure two ways: by raising,
+        # and by *returning* a non-success status dict ("failed", or
+        # "human_action_required" when it resumes a pending interactive
+        # login). Returning without checking reported every one of those as a
+        # successful refresh.
+        if result.get("status") != "success" or not result.get("success"):
+            logger.warning(
+                "Auto-refresh did not complete",
+                status=result.get("status"),
+                action=result.get("action"),
+                refresh_message=result.get("message"),
+            )
+            if result.get("status") == "human_action_required":
+                return {
+                    "error": True,
+                    "code": "HUMAN_ACTION_REQUIRED",
+                    "message": (
+                        "Your HEB session could not be refreshed automatically: "
+                        f"{result.get('message', 'human action required')}"
+                    ),
+                    "action": result.get("action"),
+                    "screenshot_path": result.get("screenshot_path"),
+                    "instructions": result.get("instructions"),
+                    "auto_refresh_attempted": True,
+                }
+            # Don't block the operation - the adopted live browser session may
+            # still work even when the saved state didn't get refreshed.
+            return None
+
+        # Trust but verify: a refresh can report success while writing back a
+        # storage state whose reese84 token is still expired (HEB served a
+        # cached token, or the page never regenerated one).
+        post_status = get_session_status()
+        if post_status["needs_refresh"] or not post_status["authenticated"]:
+            logger.warning(
+                "Auto-refresh reported success but session is still not valid",
+                elapsed_seconds=result.get("elapsed_seconds"),
+                authenticated=post_status["authenticated"],
+                needs_refresh=post_status["needs_refresh"],
+                time_remaining_hours=post_status["time_remaining_hours"],
+                session_message=post_status["message"],
+            )
+            return None
+
         logger.info(
             "Session auto-refreshed successfully",
             elapsed_seconds=result.get("elapsed_seconds"),
+            time_remaining_hours=post_status["time_remaining_hours"],
         )
         return None
 
@@ -719,7 +803,11 @@ async def auto_refresh_session_if_needed() -> dict[str, Any] | None:
             "code": "LOGIN_REQUIRED",
             "message": (
                 "Your HEB session has expired and requires manual login. "
-                "Run session_refresh(headless=False) to log in."
+                "Recommended: export cookies from a browser you're already "
+                "logged into at heb.com and pass them to "
+                "session_load_cookies(cookies_txt=...). "
+                "Alternatively, try session_refresh(headless=False), though "
+                "HEB's bot detection frequently blocks automated logins."
             ),
             "auto_refresh_attempted": True,
         }

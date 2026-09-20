@@ -10,12 +10,20 @@ After install, run: playwright install chromium
 
 import asyncio
 import glob
+import json
 import os
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 import structlog
+
+from texas_grocery_mcp.auth.browser_fingerprint import context_kwargs, launch_browser
+from texas_grocery_mcp.auth.browser_session import (
+    get_browser_session,
+    load_storage_state_for_refresh,
+)
 
 logger = structlog.get_logger()
 
@@ -159,6 +167,47 @@ async def _detect_security_challenge(page: Any) -> bool:
         return _detect_security_challenge_html(content)
     except Exception:
         return False
+
+
+async def _wait_for_fresh_reese84(page: Any, timeout_ms: int = 20000) -> dict[str, Any] | None:
+    """Wait until HEB's script has written a reese84 token to localStorage.
+
+    Refreshes start from a storage state with the old token stripped (see
+    ``strip_reese84``), so whatever shows up here is newly minted. Polls
+    rather than sleeping a fixed interval: the token usually lands within a
+    few seconds, and a blind sleep either wastes time or saves a state with
+    no token in it at all.
+
+    Args:
+        page: Playwright page sitting on a heb.com origin
+        timeout_ms: How long to wait before giving up
+
+    Returns:
+        The parsed reese84 payload, or None if none appeared in time.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        try:
+            raw = await page.evaluate("() => window.localStorage.getItem('reese84')")
+        except Exception:
+            raw = None
+
+        if raw:
+            data: dict[str, Any] = {}
+            with suppress(json.JSONDecodeError, TypeError):
+                data = json.loads(raw)
+            # renewInSec is the site's own "good for N more seconds" hint;
+            # a token carrying one is ready to use.
+            if data.get("token") and data.get("renewInSec"):
+                return data
+
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "No fresh reese84 token appeared before timeout", timeout_ms=timeout_ms
+            )
+            return None
+
+        await page.wait_for_timeout(500)
 
 
 async def _detect_login_form(page: Any) -> bool:
@@ -320,89 +369,94 @@ async def refresh_session_with_browser(
 
         # Headless mode: refresh tokens quickly, but cannot handle human interaction.
         if headless:
+            # NB: manual start()/stop() rather than `async with async_playwright()`.
+            # On success this browser is handed to the shared session and must
+            # stay alive; exiting the context manager would stop the driver out
+            # from under it.
+            adopted = False
             try:
-                async with async_playwright() as p:
-                    logger.info("Launching browser for session refresh", headless=headless)
-                    browser = await p.chromium.launch(
-                        headless=True,
-                        args=[
-                            "--disable-blink-features=AutomationControlled",
-                            "--no-first-run",
-                            "--no-default-browser-check",
-                            "--disable-infobars",
-                        ],
+                logger.info("Launching browser for session refresh", headless=headless)
+                playwright = await async_playwright().start()
+                browser = await launch_browser(playwright, headless=True)
+
+                # Drops the saved reese84 so this browser is issued a fresh
+                # one - carrying the old token forward is what made refreshes
+                # write back an unchanged, equally-stale token.
+                storage_state = load_storage_state_for_refresh(auth_path)
+                context = await browser.new_context(
+                    **context_kwargs(browser, storage_state=storage_state)
+                )
+
+                page = await context.new_page()
+                logger.info("Navigating to HEB.com...")
+                response = await page.goto(
+                    "https://www.heb.com",
+                    wait_until="load",
+                    timeout=timeout,
+                )
+
+                if response and response.status >= 400:
+                    raise BrowserRefreshError(f"HEB.com returned HTTP status {response.status}")
+
+                # Fail fast if we're on a security interstitial.
+                if await _detect_security_challenge(page) or await _detect_captcha(page):
+                    raise BrowserRefreshError(
+                        "Security challenge detected in headless mode. "
+                        "Run session_refresh(headless=False) to complete it."
                     )
 
-                    storage_state = str(auth_path) if auth_path.exists() else None
-                    context = await browser.new_context(
-                        user_agent=(
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"
-                        ),
-                        storage_state=storage_state,
+                if not await _check_authenticated(context):
+                    raise LoginRequiredError(
+                        "HEB requires login. Your session has expired.\n"
+                        "Run session_refresh(headless=False) to login manually."
                     )
 
-                    page = await context.new_page()
-                    logger.info("Navigating to HEB.com...")
-                    response = await page.goto(
-                        "https://www.heb.com",
-                        wait_until="load",
-                        timeout=timeout,
+                logger.info("Waiting for reese84 token generation...")
+                reese84 = await _wait_for_fresh_reese84(page)
+                if reese84 is None:
+                    raise BrowserRefreshError(
+                        "HEB did not issue a reese84 bot-detection token, so the "
+                        "session could not be refreshed."
                     )
+                logger.info(
+                    "Fresh reese84 token issued", renew_in_sec=reese84.get("renewInSec")
+                )
 
-                    if response and response.status >= 400:
-                        await browser.close()
-                        raise BrowserRefreshError(f"HEB.com returned HTTP status {response.status}")
+                logger.info("Saving session state", auth_path=str(auth_path))
+                auth_path.parent.mkdir(parents=True, exist_ok=True)
+                await context.storage_state(path=str(auth_path))
 
-                    # Fail fast if we're on a security interstitial.
-                    if await _detect_security_challenge(page) or await _detect_captcha(page):
-                        await browser.close()
-                        raise BrowserRefreshError(
-                            "Security challenge detected in headless mode. "
-                            "Run session_refresh(headless=False) to complete it."
-                        )
+                # Ensure secure permissions on auth file
+                from texas_grocery_mcp.utils.secure_file import ensure_secure_permissions
 
-                    if not await _check_authenticated(context):
-                        await browser.close()
-                        raise LoginRequiredError(
-                            "HEB requires login. Your session has expired.\n"
-                            "Run session_refresh(headless=False) to login manually."
-                        )
+                ensure_secure_permissions(auth_path)
 
-                    logger.info("Waiting for reese84 token generation...")
-                    await page.wait_for_timeout(5000)
+                cookies = await context.cookies()
+                local_storage_count = await page.evaluate("() => window.localStorage.length")
 
-                    logger.info("Saving session state", auth_path=str(auth_path))
-                    auth_path.parent.mkdir(parents=True, exist_ok=True)
-                    await context.storage_state(path=str(auth_path))
+                # Keep this live browser as the shared authenticated session
+                # rather than closing it - replaying its saved cookies into a
+                # separate client is what HEB's WAF rejects.
+                await get_browser_session().adopt(playwright, browser, context, page)
+                adopted = True
 
-                    # Ensure secure permissions on auth file
-                    from texas_grocery_mcp.utils.secure_file import ensure_secure_permissions
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    "Session refreshed successfully",
+                    elapsed_seconds=round(elapsed, 1),
+                    cookies_count=len(cookies),
+                    local_storage_count=local_storage_count,
+                )
 
-                    ensure_secure_permissions(auth_path)
-
-                    cookies = await context.cookies()
-                    local_storage_count = await page.evaluate("() => window.localStorage.length")
-                    await browser.close()
-
-                    elapsed = time.monotonic() - start_time
-                    logger.info(
-                        "Session refreshed successfully",
-                        elapsed_seconds=round(elapsed, 1),
-                        cookies_count=len(cookies),
-                        local_storage_count=local_storage_count,
-                    )
-
-                    return {
-                        "success": True,
-                        "status": "success",
-                        "message": f"Session refreshed successfully in {elapsed:.1f}s",
-                        "elapsed_seconds": round(elapsed, 1),
-                        "auth_path": str(auth_path),
-                        "cookies_count": len(cookies),
-                        "local_storage_count": local_storage_count,
-                    }
+                return {
+                    "success": True,
+                    "status": "success",
+                    "message": f"Session refreshed successfully in {elapsed:.1f}s",
+                    "elapsed_seconds": round(elapsed, 1),
+                    "auth_path": str(auth_path),
+                    "cookies_count": len(cookies),
+                    "local_storage_count": local_storage_count,
+                }
 
             except PlaywrightNotInstalledError:
                 raise
@@ -423,6 +477,15 @@ async def refresh_session_with_browser(
                     elapsed_seconds=round(elapsed, 1),
                 )
                 raise BrowserRefreshError(f"Browser refresh failed: {e}") from e
+            finally:
+                # Only tear down if the session didn't take ownership.
+                if not adopted:
+                    if browser is not None:
+                        with suppress(Exception):
+                            await browser.close()
+                    if playwright is not None:
+                        with suppress(Exception):
+                            await playwright.stop()
 
         # Non-headless mode: NEVER block waiting for login. Start an interactive
         # flow, take a screenshot, and return control to the agent/user immediately.
@@ -432,17 +495,9 @@ async def refresh_session_with_browser(
             playwright = await async_playwright().start()
 
             logger.info("Launching browser for session refresh", headless=False)
-            browser = await playwright.chromium.launch(
-                headless=False,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-infobars",
-                ],
-            )
+            browser = await launch_browser(playwright, headless=False)
 
-            storage_state = str(auth_path) if auth_path.exists() else None
+            storage_state = load_storage_state_for_refresh(auth_path)
             if storage_state:
                 logger.info(
                     "Loading existing auth state for smart refresh",
@@ -450,12 +505,7 @@ async def refresh_session_with_browser(
                 )
 
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                storage_state=storage_state,
+                **context_kwargs(browser, storage_state=storage_state)
             )
             page = await context.new_page()
 
@@ -517,7 +567,14 @@ async def refresh_session_with_browser(
             if await _check_authenticated(context):
                 logger.info("Already authenticated - refreshing session tokens")
                 logger.info("Waiting for reese84 token generation...")
-                await page.wait_for_timeout(5000)
+                reese84 = await _wait_for_fresh_reese84(page)
+                if reese84 is None:
+                    logger.warning("Saving session without a fresh reese84 token")
+                else:
+                    logger.info(
+                        "Fresh reese84 token issued",
+                        renew_in_sec=reese84.get("renewInSec"),
+                    )
 
                 logger.info("Saving session state", auth_path=str(auth_path))
                 auth_path.parent.mkdir(parents=True, exist_ok=True)
@@ -824,23 +881,9 @@ async def auto_login_with_credentials(
 
             # Launch browser (visible by default for human handoff)
             logger.info("Launching browser for auto-login", headless=headless)
-            browser = await playwright.chromium.launch(
-                headless=headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-infobars",
-                ],
-            )
+            browser = await launch_browser(playwright, headless=headless)
 
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
+            context = await browser.new_context(**context_kwargs(browser))
 
             page = await context.new_page()
 
@@ -1525,9 +1568,11 @@ async def _complete_login(
             cookies_count=len(cookies),
         )
 
-        # Cleanup
+        # Hand the live browser to the shared session instead of closing it -
+        # same rationale as the headless refresh path. This is the browser that
+        # actually logged in, so it's the one HEB's WAF trusts.
         _pending_login_state = None
-        await _cleanup_browser(playwright, browser)
+        await get_browser_session().adopt(playwright, browser, context, page)
 
         return {
             "status": "success",

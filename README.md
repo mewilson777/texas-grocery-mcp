@@ -19,7 +19,13 @@
 | 🏪 **Store Search** | Find HEB stores by address or zip code |
 | 🔍 **Product Search** | Search products with pricing and availability |
 | 📋 **Product Details** | Ingredients, nutrition facts, allergens, warnings |
-| 🔄 **Auto Session Refresh** | Handles bot detection automatically (~15 seconds) |
+| 🍪 **Cookie Import** | Authenticate from your own browser session in one paste |
+
+> **On authentication:** HEB runs aggressive bot detection, and sessions
+> established by automated browsers get blocked or rejected routinely. The
+> reliable path is importing cookies from your own real browser session - see
+> [Session Management](#-session-management). An embedded-browser auto-refresh
+> exists (`session_refresh`) but is best-effort at most.
 
 ---
 
@@ -40,13 +46,18 @@ playwright install chromium
 
 This enables **fast auto-refresh** (~15 seconds) using an embedded browser.
 
-### Prerequisites
+### Optional: Playwright MCP
 
-For store changes and session management, you'll also need **Playwright MCP**:
+Not required. If the embedded browser isn't installed, `session_refresh`
+degrades to returning a list of [Playwright
+MCP](https://github.com/microsoft/playwright-mcp) commands for your agent to
+run instead:
 
 ```bash
-npm install -g @anthropic-ai/mcp-playwright
+npm install -g @playwright/mcp
 ```
+
+The recommended cookie-import workflow needs neither of these.
 
 ---
 
@@ -79,8 +90,34 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HEB_DEFAULT_STORE` | Default store ID | None |
-| `REDIS_URL` | Redis cache URL | None (in-memory) |
-| `LOG_LEVEL` | Logging level | INFO |
+| `TYPEAHEAD_FALLBACK_ENABLED` | See note below | `false` |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` (logs go to stderr) | `INFO` |
+| `AUTO_REFRESH_ENABLED` | Auto-refresh the session before authenticated tools run | `true` |
+| `AUTO_REFRESH_THRESHOLD_HOURS` | Refresh when less than this much token life remains | `0.05` (3 min) |
+| `AUTO_REFRESH_ON_STARTUP` | Refresh on server startup | `false` |
+| `THROTTLING_ENABLED` | Global request throttling | `true` |
+| `MAX_CONCURRENT_SSR_SEARCHES` | Concurrent SSR product searches | `3` |
+| `MIN_SSR_DELAY_MS` | Minimum delay between SSR requests | `200` |
+| `MAX_CONCURRENT_GRAPHQL` | Concurrent GraphQL calls | `5` |
+| `MIN_GRAPHQL_DELAY_MS` | Minimum delay between GraphQL requests | `100` |
+| `RETRY_ATTEMPTS` | Retries for failed requests | `3` |
+| `CIRCUIT_BREAKER_THRESHOLD` | Failures before the breaker opens | `5` |
+| `CIRCUIT_BREAKER_TIMEOUT` | Seconds before the breaker retries | `30` |
+| `AUTH_STATE_PATH` | Session state file | `~/.texas-grocery-mcp/auth.json` |
+
+See `utils/config.py` for the full list.
+
+#### `TYPEAHEAD_FALLBACK_ENABLED`
+
+When HEB's authenticated product search fails (expired session, WAF block,
+frontend change), `product_search` can fall back to HEB's autocomplete
+endpoint. Those results are **names only** - no real prices, no real product
+IDs, so they can't be passed to `product_get`.
+
+It's **off by default**, so a failed search returns zero products plus a
+`fallback_reason` explaining why. Turn it on only if you'd rather have
+suggestions than nothing, and check `data_source` in the response before
+trusting any result.
 
 ---
 
@@ -124,26 +161,37 @@ The `product_get` tool returns:
 
 ## 🔐 Session Management
 
-HEB uses bot detection that expires every ~11 minutes. This MCP handles it automatically!
+HEB's bot detection (Imperva/Incapsula, via a `reese84` token) expires tokens
+roughly every ~10-15 minutes
+of active use, and it routinely blocks or rejects sessions that automated
+browsers establish - so the reliable way to authenticate is importing cookies
+from your own real, human-driven browser session.
 
-### ⚡ Fast Auto-Refresh (Recommended)
+### 🍪 Cookie Import (Recommended)
 
-With `[browser]` support installed:
+1. Log in to [heb.com](https://www.heb.com) in your normal browser and
+   complete any verification prompts as usual.
+2. Export cookies for `heb.com` with an extension like
+   ["Get cookies.txt LOCALLY"](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc).
+3. Paste the exported text into `session_load_cookies`:
 
 ```
-Agent uses: session_refresh()
-# ✅ Completes in ~10-15 seconds
+Agent uses: session_load_cookies(cookies_txt="<pasted export>")
+Agent uses: session_status()  # confirm it worked
 ```
 
-### 🔑 Auto-Login
+Re-run this whenever your session stops working - expect to redo it every
+so often rather than once-and-done, since HEB's bot-detection token rotates
+frequently.
 
-Save your credentials once for automatic login:
+### ⚡ Auto-Refresh / Auto-Login (Experimental, unreliable)
 
-```
-Agent uses: session_save_credentials(email="you@email.com", password="...")
-# Credentials stored securely in system keyring
-# Future session refreshes will auto-login!
-```
+`session_refresh()` and `session_save_credentials()` drive an embedded
+Playwright browser to log in or refresh tokens automatically. In practice
+this frequently gets blocked by HEB's bot detection, headless or not, and
+even a full success there can still fail HEB's checks on later authenticated
+calls. Treat these as a fallback to try, not the primary workflow - cookie
+import above is what actually works.
 
 ---
 
@@ -152,24 +200,27 @@ Agent uses: session_save_credentials(email="you@email.com", password="...")
 ### 🏪 Store Tools
 | Tool | Description |
 |------|-------------|
-| `store_search` | Find stores by address |
-| `store_change` | Set preferred store |
+| `store_search` | Find stores by address or zip (`radius_miles` 1-100, default 25) |
+| `store_change` | Set preferred store. Syncs to HEB.com when authenticated; otherwise sets a local default and says so via `method: "local_only"` |
 | `store_get_default` | Get current default store |
 
 ### 🔍 Product Tools
 | Tool | Description |
 |------|-------------|
-| `product_search` | Search products with pricing |
-| `product_search_batch` | Search multiple products (up to 20) |
-| `product_get` | Get detailed product info |
+| `product_search` | Search products with pricing (`limit` 1-50, default 20; `fields`: `minimal`/`standard`/`all`) |
+| `product_search_batch` | Search up to 20 queries at once (`limit_per_query` 1-20, default 5) |
+| `product_get` | Get detailed product info by ID |
 
 ### 🔐 Session Tools
 | Tool | Description |
 |------|-------------|
-| `session_status` | Check session health |
-| `session_refresh` | Refresh/login session |
-| `session_save_credentials` | Save credentials for auto-login |
-| `session_clear` | Logout |
+| `session_status` | Check session health, token lifetime, and credential storage |
+| `session_load_cookies` | Import cookies.txt from your browser (**recommended**) |
+| `session_save_instructions` | Get the step-by-step manual authentication walkthrough |
+| `session_refresh` | Refresh/login via embedded browser (best-effort; often blocked) |
+| `session_save_credentials` | Save credentials for auto-login (same caveats) |
+| `session_clear_credentials` | Remove saved credentials |
+| `session_clear` | Clear saved session (logout) |
 
 ---
 
@@ -193,13 +244,16 @@ cd texas-grocery-mcp
 pip install -e ".[dev]"
 playwright install chromium
 
-# Run tests
-pytest tests/ -v
-
 # Linting & type checking
-ruff check src/
-mypy src/
+ruff check src
+mypy src
+
+# Run the server directly
+texas-grocery-mcp
 ```
+
+There is currently no test suite - see [CONTRIBUTING.md](CONTRIBUTING.md#tests)
+for why, and what would be welcome instead.
 
 ### 🐳 Docker
 
@@ -212,19 +266,34 @@ docker-compose up --build
 ## 🏗️ Architecture
 
 ```
+        🍪 Your browser's cookies.txt export
+                      │
+                      ▼  session_load_cookies
 ┌─────────────────────────────────────────────────────────────┐
-│                    User's MCP Environment                    │
+│              🛒 Texas Grocery MCP                           │
 │                                                             │
-│  ┌─────────────────────┐    ┌─────────────────────────────┐ │
-│  │  🎭 Playwright MCP  │    │   🛒 Texas Grocery MCP      │ │
-│  │  (Browser Auth)     │───▶│   (Grocery Logic)           │ │
-│  └─────────────────────┘    └─────────────────────────────┘ │
-│                                        │                     │
-└────────────────────────────────────────┼─────────────────────┘
-                                         │
-                                         ▼
-                                   🌐 HEB GraphQL API
+│   tools/  ──▶  HEBGraphQLClient  ──▶  reliability/          │
+│                      │                 (throttle, retry,    │
+│                      │                  breaker, cache)     │
+│                      │                                      │
+│        ┌─────────────┴─────────────┐                        │
+│        ▼                           ▼                        │
+│  Persisted GraphQL           Next.js SSR scrape             │
+│  (store search/select)       (product search + details)     │
+│        │                           │                        │
+│        └─────────────┬─────────────┘                        │
+│                      │       ▼ on failure, if enabled       │
+│                      │   Typeahead fallback (names only)    │
+└──────────────────────┼──────────────────────────────────────┘
+                       ▼
+                 🌐 heb.com (unofficial endpoints, behind Imperva)
 ```
+
+Store search uses HEB's persisted GraphQL queries. Product search scrapes
+HEB's server-rendered pages instead, because that's where full pricing and
+inventory actually appear. Both are reverse-engineered against HEB's current
+frontend and **will break when HEB ships changes** - that's the expected
+failure mode, not an anomaly.
 
 ---
 

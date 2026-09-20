@@ -130,8 +130,12 @@ class Settings(BaseSettings):
         description="Enable automatic session refresh before tool execution",
     )
     auto_refresh_threshold_hours: float = Field(
-        default=4.0,
-        ge=0.5,
+        default=.05,
+        # A fresh reese84 token is only good for ~15 minutes (0.25h), so any
+        # threshold at or above that refreshes on every single tool call.
+        # The lower bound has to allow sub-hour values for this to be tunable
+        # at all - e.g. 0.05 (3 min) refreshes only as the token runs out.
+        ge=0.0,
         le=24.0,
         description="Refresh session when less than this many hours remaining",
     )

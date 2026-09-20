@@ -20,19 +20,22 @@ This guide covers common issues and their solutions when using the Texas Grocery
 - `session_status` shows `authenticated: false` or `needs_refresh: true`
 - Operations return "Login required" errors
 
-**Solution:**
+**Solution (recommended - reliable):**
 ```
-1. Call session_refresh(headless=False)
-2. Complete login in the browser window that opens
-3. Tell the assistant "done" when you've logged in
-4. The assistant will call session_refresh() again to save the session
+1. Log in to heb.com in your own regular browser
+2. Export cookies for heb.com (e.g. with "Get cookies.txt LOCALLY")
+3. Call session_load_cookies(cookies_txt="<pasted export>")
+4. Call session_status to confirm
 ```
 
-**If auto-login is configured:**
+**Fallback (session_refresh) - HEB's bot detection frequently blocks this
+regardless of headless mode; don't expect it to work reliably:**
 ```
-1. Call session_refresh() - it will attempt automatic login
-2. If CAPTCHA appears, you'll get a screenshot and need to solve it manually
-3. After solving, tell the assistant "done"
+1. Call session_refresh() - opens a visible browser
+2. Complete login/CAPTCHA in that window if prompted
+3. Tell the assistant "done" when you've logged in
+4. The assistant will call session_refresh() again to save the session
+5. If it keeps failing, switch to the cookie-import solution above
 ```
 
 ---
@@ -42,19 +45,30 @@ This guide covers common issues and their solutions when using the Texas Grocery
 **Symptoms:**
 - `security_challenge_detected: true` in search results
 - Browser shows "Please verify you are human"
-- Screenshot shows hCaptcha or "Additional security check required"
+- Screenshot shows hCaptcha, "Additional security check required", or a
+  proxy/VPN block message
 
 **Cause:** HEB's Web Application Firewall (WAF) detected automated access.
+This can also be triggered by a burst of rapid/automated requests from your
+IP (repeated failed logins, tight retry loops) - if so, it may take a
+cooldown period before your IP is trusted again, independent of anything you
+change here.
 
-**Solution:**
+**Solution (recommended - reliable):** Same cookie-import steps as above -
+a fresh, legitimately-obtained cookie export is far less likely to trip the
+WAF than another automated login attempt.
+
+**Fallback (session_refresh):**
 ```
-1. Call session_refresh(headless=False)
-2. Solve the CAPTCHA in the browser window
+1. Call session_refresh() - opens a visible browser
+2. Solve the CAPTCHA in the browser window if one appears
 3. Navigate around the site briefly (search for a product, click a category)
 4. Tell the assistant "done"
 ```
 
 **Prevention:**
+- Don't retry `session_refresh` repeatedly after it fails - that's more
+  likely to reinforce a WAF block than clear it
 - Don't make too many rapid requests
 - Use `product_search_batch` instead of many individual searches
 - Keep your session refreshed (don't let it expire completely)
@@ -105,13 +119,17 @@ This guide covers common issues and their solutions when using the Texas Grocery
 ### "No products found" / Empty Results
 
 **Symptoms:**
-- `product_search` returns `count: 0`
-- `data_source: typeahead_suggestions`
+- `product_search` returns `count: 0` and `data_source: none`, with a `note`
+  and `fallback_reason` explaining why
+- Or it returns `data_source: typeahead_suggestions` (only when
+  `TYPEAHEAD_FALLBACK_ENABLED=true`), meaning names with no real prices or IDs
 
 **Causes:**
 - Query too specific or misspelled
 - Store doesn't carry the product
-- Session expired (falling back to limited search)
+- Session expired, so the authenticated SSR search failed. Typeahead fallback
+  is **off by default**, so this surfaces as zero products rather than as
+  placeholder suggestions - read `fallback_reason` to tell the two apart
 
 **Solutions:**
 
@@ -128,7 +146,7 @@ This guide covers common issues and their solutions when using the Texas Grocery
 
 3. **Refresh session if data_source is "typeahead_suggestions":**
    ```
-   session_refresh()
+   session_load_cookies(cookies_txt="<fresh export from your browser>")
    product_search("your query")
    ```
 
@@ -144,7 +162,7 @@ This guide covers common issues and their solutions when using the Texas Grocery
 
 **Solution:**
 ```
-1. Refresh your session: session_refresh()
+1. Refresh your session: session_load_cookies(cookies_txt="<fresh export>")
 2. Search again with the same query
 3. If still getting suggestions, try a more specific query
 4. Or use product_get with a known product_id
@@ -162,7 +180,7 @@ This guide covers common issues and their solutions when using the Texas Grocery
 **Solution:**
 ```
 1. Check session: session_status()
-2. If not authenticated: session_refresh(headless=False)
+2. If not authenticated: session_load_cookies(cookies_txt="<fresh export>")
 3. Set a store: store_change("store_id")
 4. Search again
 ```
@@ -171,20 +189,29 @@ This guide covers common issues and their solutions when using the Texas Grocery
 
 ## Store Issues
 
-### "STORE_NOT_ELIGIBLE" Error
+### `store_change` Fails
 
 **Symptoms:**
-- `store_change` returns `code: STORE_NOT_ELIGIBLE`
-- Message says store doesn't support online shopping
+- `store_change` returns `code: INVALID_STORE_ID`, `STORE_CHANGE_FAILED`,
+  or `NOT_AUTHENTICATED`
 
-**Cause:** Some HEB stores are in-store only (no curbside/delivery).
+**Causes and solutions:**
 
-**Solution:**
-```
-1. Search for nearby stores: store_search("your address")
-2. Look for stores with supports_curbside: true
-3. Choose one of those stores
-```
+- `INVALID_STORE_ID` - the ID isn't one HEB recognizes. Get a real one from
+  `store_search("your address")` rather than guessing.
+- `NOT_AUTHENTICATED` - no valid session. Import cookies first:
+  `session_load_cookies(cookies_txt="<fresh export>")`.
+- `STORE_CHANGE_FAILED` - HEB rejected or didn't apply the change. This is
+  most often the WAF distrusting an API call that didn't originate from the
+  live browser session that logged in, so it can happen immediately after a
+  *successful* `session_load_cookies`. Re-import a fresh cookie export and
+  retry; if it persists, change your store on heb.com directly and then call
+  `store_change` with the same ID to sync the local default.
+
+**Note:** when you aren't authenticated, `store_change` doesn't fail - it sets
+a *local* default for product searches only and returns
+`method: "local_only"` with a `warning`. Check that field if you expected the
+change to reach your HEB.com account.
 
 ---
 
@@ -205,11 +232,12 @@ This guide covers common issues and their solutions when using the Texas Grocery
    - Just zip code: "78701"
    - City and state: "Austin, TX"
 
-2. **Use known store IDs directly:**
+2. **Use a bundled store ID directly:** these ship in `KNOWN_STORES` and are
+   used as the fallback suggestion when no default store is set:
    ```
-   # Common Austin area stores:
-   store_change("465")  # HEB Mueller
-   store_change("573")  # HEB Hancock
+   store_change("737")  # The Heights H-E-B (Houston)
+   store_change("579")  # Buffalo Speedway H-E-B (Houston)
+   store_change("150")  # Montrose H-E-B (Houston)
    ```
 
 ---
@@ -235,16 +263,18 @@ This guide covers common issues and their solutions when using the Texas Grocery
 ### "Circuit breaker open"
 
 **Symptoms:**
-- Multiple operations fail
-- `health_ready` shows circuit breaker open
+- Multiple operations fail in a row, immediately and without a network delay
 
 **Cause:** Too many consecutive failures triggered the circuit breaker.
 
 **Solution:**
 ```
 1. Wait 30 seconds for the circuit breaker to recover
-2. Check health_ready() - wait until graphql_api status is "up"
-3. Retry your operation
+   (CIRCUIT_BREAKER_TIMEOUT, default 30s)
+2. Retry your operation - the breaker lets a trial request through
+   once the timeout has elapsed
+3. If it reopens immediately, the underlying problem is still there:
+   check session_status() and your network connection
 ```
 
 ---
@@ -286,14 +316,17 @@ playwright install chromium
 
 ## Error Code Reference
 
-| Code | Meaning | Solution |
-|------|---------|----------|
-| `NO_STORE_SET` | No default store configured | Use `store_change("store_id")` |
-| `STORE_NOT_ELIGIBLE` | Store doesn't support online orders | Choose a different store |
-| `INVALID_PRODUCT_ID` | Product ID format is wrong | Use ID from `product_search` results |
-| `PRODUCT_NOT_FOUND` | Product doesn't exist | Verify product ID |
-| `LOGIN_REQUIRED` | Session expired | Use `session_refresh(headless=False)` |
-| `FETCH_ERROR` | Network/API error | Check connection, retry |
+| Code | Emitted by | Meaning | Solution |
+|------|------------|---------|----------|
+| `NO_STORE_SET` | `product_search` | No default store configured | Use `store_change("store_id")` |
+| `INVALID_PRODUCT_ID` | `product_get` | Product ID is malformed, or is a `suggestion-` placeholder | Use an ID from `product_search` results |
+| `PRODUCT_NOT_FOUND` | `product_get` | HEB returned no product for that ID | Verify the product ID |
+| `FETCH_ERROR` | `product_get` | Network/API error | Check connection, retry |
+| `NOT_AUTHENTICATED` | `store_change` | No valid session | `session_load_cookies(cookies_txt=...)` |
+| `INVALID_STORE_ID` | `store_change` | HEB doesn't recognize that store ID | Get one from `store_search` |
+| `STORE_CHANGE_FAILED` | `store_change` | HEB rejected or didn't apply the change | See [`store_change` Fails](#store_change-fails) |
+| `LOGIN_REQUIRED` | auto-refresh | Session expired and couldn't be refreshed | `session_load_cookies(cookies_txt=...)` |
+| `HUMAN_ACTION_REQUIRED` | auto-refresh | Refresh hit a login form, CAPTCHA, 2FA, or WAF page | Check `screenshot_path`, then prefer cookie import |
 
 ---
 
@@ -302,8 +335,11 @@ playwright install chromium
 If you're still stuck:
 
 1. **Check session status:** `session_status()` - provides diagnostic info
-2. **Check health:** `health_ready()` - shows component status
+2. **Inspect the search diagnostics:** `product_search` returns `data_source`,
+   `authenticated`, `attempts`, and (when relevant) `fallback_reason` and
+   `search_url`, which show exactly which query variations and methods were tried
 3. **Enable debug logging:** Set `LOG_LEVEL=DEBUG` environment variable
+   (logs go to stderr)
 4. **Report issues:** https://github.com/mgwalkerjr95/texas-grocery-mcp/issues
 
 When reporting issues, include:
